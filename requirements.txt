@@ -8,3 +8,4 @@ trimesh
 pillow
 scipy
 coolprop
+meshio
