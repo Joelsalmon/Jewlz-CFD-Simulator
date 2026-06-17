@@ -51,10 +51,10 @@ R_AIR = 287.05
 DEVELOPER_MODE = False
 AUTO_INSTALL_PDF_EXPORTER = True
 
-# Local Docker/OpenFOAM worker configuration.
-# This lets the public Streamlit frontend stay lightweight while your PC runs OpenFOAM in Docker.
-DOCKER_OPENFOAM_CONTAINER = os.environ.get("JEWLZ_OPENFOAM_CONTAINER", "jewlz-openfoam")
-DOCKER_OPENFOAM_IMAGE = os.environ.get("JEWLZ_OPENFOAM_IMAGE", "opencfd/openfoam-default:latest")
+# Local Docker/OpenFOAM worker settings.
+DOCKER_OPENFOAM_CONTAINER = "jewlz-openfoam"
+DOCKER_OPENFOAM_IMAGE = "opencfd/openfoam-default:latest"
+DOCKER_OPENFOAM_RUN_ROOT = "/tmp/jewlz_fluidforce_openfoam"
 
 
 # Embedded Jewlz Technologies logo for PDF reports.
@@ -2191,6 +2191,160 @@ def safe_name(name: str) -> str:
     return "".join(keep)
 
 
+def docker_cli_available():
+    """Returns True when Docker CLI is reachable from the Python environment."""
+    try:
+        result = subprocess.run(
+            ["docker", "version", "--format", "{{.Server.Version}}"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=15,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def docker_container_exists(container_name=DOCKER_OPENFOAM_CONTAINER):
+    try:
+        result = subprocess.run(
+            ["docker", "ps", "-a", "--filter", f"name=^{container_name}$", "--format", "{{.Names}}"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=15,
+        )
+        names = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        return result.returncode == 0 and container_name in names
+    except Exception:
+        return False
+
+
+def docker_container_running(container_name=DOCKER_OPENFOAM_CONTAINER):
+    try:
+        result = subprocess.run(
+            ["docker", "ps", "--filter", f"name=^{container_name}$", "--format", "{{.Names}}"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=15,
+        )
+        names = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        return result.returncode == 0 and container_name in names
+    except Exception:
+        return False
+
+
+def ensure_docker_openfoam_container(container_name=DOCKER_OPENFOAM_CONTAINER):
+    """Ensures the local OpenFOAM Docker container is running."""
+    if not docker_cli_available():
+        return False, "Docker CLI is not available from this Python environment."
+    if docker_container_running(container_name):
+        return True, f"Docker container '{container_name}' is running."
+    if docker_container_exists(container_name):
+        try:
+            result = subprocess.run(
+                ["docker", "start", container_name],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=30,
+            )
+            if result.returncode == 0:
+                return True, f"Docker container '{container_name}' started."
+            return False, result.stdout.strip()
+        except Exception as e:
+            return False, str(e)
+    return False, (
+        f"Docker container '{container_name}' was not found. Create it with: "
+        f"docker run -it --name {container_name} {DOCKER_OPENFOAM_IMAGE} bash"
+    )
+
+
+def docker_exec_openfoam(command: str, timeout=120, cwd_container=None, container_name=DOCKER_OPENFOAM_CONTAINER):
+    """Runs a command inside the local OpenFOAM Docker container."""
+    ok, msg = ensure_docker_openfoam_container(container_name)
+    if not ok:
+        return False, msg
+    exec_cmd = ["docker", "exec"]
+    if cwd_container:
+        exec_cmd += ["-w", str(cwd_container)]
+    exec_cmd += [container_name, "bash", "-lc", command]
+    try:
+        result = subprocess.run(
+            exec_cmd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+        )
+        return result.returncode == 0, result.stdout
+    except Exception as e:
+        return False, str(e)
+
+
+def docker_openfoam_command_available(command_name: str):
+    ok, output = docker_exec_openfoam(f"which {command_name}", timeout=30)
+    return ok and command_name in output, output.strip()
+
+
+def run_docker_openfoam_command(command: str, cwd_windows_path=None, timeout=2400, container_name=DOCKER_OPENFOAM_CONTAINER):
+    """
+    Runs an OpenFOAM command inside Docker using a Linux-native temp case folder.
+    Copies the local case into the container, runs the command, then copies results back.
+    """
+    ok, msg = ensure_docker_openfoam_container(container_name)
+    if not ok:
+        return False, msg
+    if cwd_windows_path is None:
+        return docker_exec_openfoam(command, timeout=timeout, container_name=container_name)
+
+    case_dir = Path(cwd_windows_path).resolve()
+    if not case_dir.exists():
+        return False, f"Case directory does not exist: {case_dir}"
+    case_name = safe_name(case_dir.name)
+    run_root = f"{DOCKER_OPENFOAM_RUN_ROOT}/{case_name}"
+    logs = []
+    try:
+        prep_cmd = f'rm -rf "{run_root}" && mkdir -p "{run_root}"'
+        ok, out = docker_exec_openfoam(prep_cmd, timeout=120, container_name=container_name)
+        logs.append(f"$ docker exec {container_name} bash -lc {prep_cmd}\n{out}\n")
+        if not ok:
+            return False, "\n".join(logs)
+
+        local_src = str(case_dir) + os.sep + "."
+        cp_in = subprocess.run(
+            ["docker", "cp", local_src, f"{container_name}:{run_root}/"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=300,
+        )
+        logs.append(f"$ docker cp {local_src} {container_name}:{run_root}/\n{cp_in.stdout}\n")
+        if cp_in.returncode != 0:
+            return False, "\n".join(logs)
+
+        ok, out = docker_exec_openfoam(command, timeout=timeout, cwd_container=run_root, container_name=container_name)
+        logs.append(f"$ docker exec -w {run_root} {container_name} bash -lc {command}\n{out}\n")
+        command_ok = ok
+
+        cp_out = subprocess.run(
+            ["docker", "cp", f"{container_name}:{run_root}/.", str(case_dir)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=600,
+        )
+        logs.append(f"$ docker cp {container_name}:{run_root}/. {case_dir}\n{cp_out.stdout}\n")
+        if cp_out.returncode != 0:
+            return False, "\n".join(logs)
+        return command_ok, "\n".join(logs)
+    except Exception as e:
+        logs.append(f"ERROR: {e}")
+        return False, "\n".join(logs)
+
+
 def wsl_available():
     """
     Robust WSL check.
@@ -2331,208 +2485,39 @@ set -e
     except Exception as e:
         return False, str(e)
 
-
-def docker_cli_available():
-    """Returns True when Docker CLI is available to this Python process."""
-    try:
-        result = subprocess.run(
-            ["docker", "version", "--format", "{{.Server.Version}}"],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=8,
-        )
-        return result.returncode == 0, result.stdout.strip()
-    except Exception as e:
-        return False, str(e)
-
-
-def docker_container_status(container_name=None):
-    """Checks whether the named OpenFOAM container exists and is running."""
-    container_name = container_name or DOCKER_OPENFOAM_CONTAINER
-    try:
-        result = subprocess.run(
-            ["docker", "inspect", "-f", "{{.State.Running}}", container_name],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=8,
-        )
-        if result.returncode != 0:
-            return False, False, result.stdout.strip()
-        running = result.stdout.strip().lower() == "true"
-        return True, running, "running" if running else "stopped"
-    except Exception as e:
-        return False, False, str(e)
-
-
-def ensure_docker_openfoam_container(container_name=None, image_name=None):
-    """
-    Ensures a long-running OpenFOAM Docker container exists and is running.
-
-    If the container exists but is stopped, it is started.
-    If it does not exist, Docker attempts to create it from DOCKER_OPENFOAM_IMAGE.
-    """
-    container_name = container_name or DOCKER_OPENFOAM_CONTAINER
-    image_name = image_name or DOCKER_OPENFOAM_IMAGE
-
-    docker_ok, docker_msg = docker_cli_available()
-    if not docker_ok:
-        return False, f"Docker CLI/daemon unavailable: {docker_msg}"
-
-    exists, running, msg = docker_container_status(container_name)
-    if exists and running:
-        return True, f"Docker container '{container_name}' is running."
-
-    if exists and not running:
-        try:
-            result = subprocess.run(
-                ["docker", "start", container_name],
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                timeout=30,
-            )
-            if result.returncode == 0:
-                return True, f"Docker container '{container_name}' was started."
-            return False, result.stdout.strip()
-        except Exception as e:
-            return False, str(e)
-
-    # Create a detached shell container that stays alive.
-    try:
-        result = subprocess.run(
-            [
-                "docker", "run", "-dit",
-                "--name", container_name,
-                image_name,
-                "bash",
-            ],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=180,
-        )
-        if result.returncode == 0:
-            return True, f"Docker container '{container_name}' created from {image_name}."
-        return False, result.stdout.strip()
-    except Exception as e:
-        return False, str(e)
-
-
-def docker_openfoam_command_available(command, container_name=None):
-    """Checks whether an OpenFOAM command is available inside the Docker container."""
-    container_name = container_name or DOCKER_OPENFOAM_CONTAINER
-    ok, msg = ensure_docker_openfoam_container(container_name)
-    if not ok:
-        return False, msg
-    try:
-        result = subprocess.run(
-            ["docker", "exec", container_name, "bash", "-lc", f"command -v {command} && {command} -help >/dev/null 2>&1 || true"],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=20,
-        )
-        found = command in result.stdout or result.returncode == 0
-        # command -v is the reliable part; if output contains a path, command is ready.
-        found = bool(result.stdout.strip())
-        return found, result.stdout.strip()
-    except Exception as e:
-        return False, str(e)
-
-
-def run_docker_openfoam_command(command: str, cwd_windows_path=None, timeout=2400, container_name=None):
-    """
-    Runs an OpenFOAM command inside the Docker/OpenFOAM container.
-
-    Workflow:
-      Windows case folder
-          -> docker cp to /tmp/jewlz_fluidforce_openfoam/<case>
-          -> run command inside Docker Linux filesystem
-          -> docker cp results back to Windows case folder
-
-    This mirrors the WSL native-temp strategy but uses Docker as the OpenFOAM worker.
-    """
-    container_name = container_name or DOCKER_OPENFOAM_CONTAINER
-    ok, msg = ensure_docker_openfoam_container(container_name)
-    if not ok:
-        return False, msg
-
-    if cwd_windows_path is not None:
-        host_case = Path(str(cwd_windows_path)).resolve()
-        case_name = safe_name(host_case.name)
-        run_root = f"/tmp/jewlz_fluidforce_openfoam/{case_name}"
-    else:
-        host_case = None
-        run_root = "/tmp/jewlz_fluidforce_openfoam/no_case"
-
-    logs = []
-
-    try:
-        # Prepare clean Linux-native run folder.
-        prep = subprocess.run(
-            ["docker", "exec", container_name, "bash", "-lc", f"rm -rf '{run_root}' && mkdir -p '{run_root}'"],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=60,
-        )
-        logs.append(f"$ docker exec {container_name} prepare {run_root}\n{prep.stdout}\n")
-        if prep.returncode != 0:
-            return False, "\n".join(logs)
-
-        # Copy case into container.
-        if host_case is not None:
-            cp_in = subprocess.run(
-                ["docker", "cp", f"{str(host_case)}{os.sep}.", f"{container_name}:{run_root}/"],
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                timeout=300,
-            )
-            logs.append(f"$ docker cp host case -> container\n{cp_in.stdout}\n")
-            if cp_in.returncode != 0:
-                return False, "\n".join(logs)
-
-        # Run OpenFOAM command.
-        script = f"cd '{run_root}' && {command}"
-        run = subprocess.run(
-            ["docker", "exec", container_name, "bash", "-lc", script],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=timeout,
-        )
-        logs.append(f"$ docker exec {container_name} bash -lc {script}\n{run.stdout}\n")
-
-        # Copy results back even if command failed so logs/partial output are available.
-        if host_case is not None:
-            cp_out = subprocess.run(
-                ["docker", "cp", f"{container_name}:{run_root}/.", str(host_case)],
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                timeout=300,
-            )
-            logs.append(f"$ docker cp container results -> host case\n{cp_out.stdout}\n")
-
-        return run.returncode == 0, "\n".join(logs)
-
-    except Exception as e:
-        logs.append(f"Docker OpenFOAM command error: {e}")
-        return False, "\n".join(logs)
-
 def openfoam_available():
     """
     Checks OpenFOAM availability.
 
     Priority:
-    1. Native commands in current OS PATH
-    2. WSL commands
-    3. Docker/OpenFOAM local worker container
+    1. Docker OpenFOAM worker container: jewlz-openfoam
+    2. Native commands in current OS PATH
+    3. WSL commands
     """
     commands = ["blockMesh", "snappyHexMesh", "simpleFoam", "foamToVTK"]
+
+    docker_outputs = {}
+    docker_ok, docker_msg = ensure_docker_openfoam_container(DOCKER_OPENFOAM_CONTAINER)
+    if docker_ok:
+        docker_results = {}
+        for cmd in commands:
+            ok, output = docker_openfoam_command_available(cmd)
+            docker_results[cmd] = bool(ok)
+            docker_outputs[cmd] = output
+        if docker_results.get("blockMesh") and docker_results.get("simpleFoam") and docker_results.get("foamToVTK"):
+            return {
+                "mode": "docker",
+                "docker": True,
+                "container": DOCKER_OPENFOAM_CONTAINER,
+                "blockMesh": docker_results.get("blockMesh", False),
+                "snappyHexMesh": docker_results.get("snappyHexMesh", False),
+                "simpleFoam": docker_results.get("simpleFoam", False),
+                "foamToVTK": docker_results.get("foamToVTK", False),
+                "docker_outputs": docker_outputs,
+                "message": docker_msg,
+            }
+    else:
+        docker_outputs["docker"] = docker_msg
 
     native = {}
     for cmd in commands:
@@ -2540,13 +2525,13 @@ def openfoam_available():
             native[cmd] = shutil.which(cmd) is not None
         except Exception:
             native[cmd] = False
-
-    if all(native.get(c, False) for c in ["blockMesh", "snappyHexMesh", "simpleFoam"]):
+    if native.get("blockMesh") and native.get("snappyHexMesh") and native.get("simpleFoam"):
         return {
             "mode": "native",
-            "blockMesh": True,
-            "snappyHexMesh": True,
-            "simpleFoam": True,
+            "docker": False,
+            "blockMesh": native.get("blockMesh", False),
+            "snappyHexMesh": native.get("snappyHexMesh", False),
+            "simpleFoam": native.get("simpleFoam", False),
             "foamToVTK": native.get("foamToVTK", False),
         }
 
@@ -2555,61 +2540,34 @@ def openfoam_available():
     for cmd in commands:
         try:
             result = subprocess.run(
-                ["wsl", "bash", "-lc", f"command -v {cmd}"],
+                ["wsl", "bash", "-lc", f"which {cmd}"],
                 text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                timeout=15,
+                timeout=30,
             )
-            wsl_results[cmd] = result.returncode == 0 and bool(result.stdout.strip())
+            wsl_results[cmd] = result.returncode == 0 and f"/{cmd}" in result.stdout
             wsl_outputs[cmd] = result.stdout.strip()
         except Exception as e:
             wsl_results[cmd] = False
             wsl_outputs[cmd] = str(e)
-
-    if all(wsl_results.get(c, False) for c in ["blockMesh", "snappyHexMesh", "simpleFoam"]):
+    if wsl_results.get("blockMesh") and wsl_results.get("snappyHexMesh") and wsl_results.get("simpleFoam"):
         return {
             "mode": "wsl",
+            "docker": False,
             "blockMesh": True,
             "snappyHexMesh": True,
             "simpleFoam": True,
             "foamToVTK": wsl_results.get("foamToVTK", False),
             "wsl_outputs": wsl_outputs,
         }
-
-    # Docker/OpenFOAM worker check.
-    docker_ok, docker_msg = ensure_docker_openfoam_container()
-    docker_results = {}
-    docker_outputs = {"docker": docker_msg}
-    if docker_ok:
-        for cmd in commands:
-            ok, out = docker_openfoam_command_available(cmd)
-            docker_results[cmd] = ok
-            docker_outputs[cmd] = out
-
-        if all(docker_results.get(c, False) for c in ["blockMesh", "snappyHexMesh", "simpleFoam"]):
-            return {
-                "mode": "docker",
-                "container": DOCKER_OPENFOAM_CONTAINER,
-                "image": DOCKER_OPENFOAM_IMAGE,
-                "docker": True,
-                "blockMesh": True,
-                "snappyHexMesh": True,
-                "simpleFoam": True,
-                "foamToVTK": docker_results.get("foamToVTK", False),
-                "docker_outputs": docker_outputs,
-                "wsl_outputs": wsl_outputs,
-            }
-
     return {
         "mode": "unavailable",
-        "container": DOCKER_OPENFOAM_CONTAINER,
-        "image": DOCKER_OPENFOAM_IMAGE,
-        "docker": docker_ok,
-        "blockMesh": native.get("blockMesh", False) or wsl_results.get("blockMesh", False) or docker_results.get("blockMesh", False),
-        "snappyHexMesh": native.get("snappyHexMesh", False) or wsl_results.get("snappyHexMesh", False) or docker_results.get("snappyHexMesh", False),
-        "simpleFoam": native.get("simpleFoam", False) or wsl_results.get("simpleFoam", False) or docker_results.get("simpleFoam", False),
-        "foamToVTK": native.get("foamToVTK", False) or wsl_results.get("foamToVTK", False) or docker_results.get("foamToVTK", False),
+        "docker": False,
+        "blockMesh": native.get("blockMesh", False) or wsl_results.get("blockMesh", False),
+        "snappyHexMesh": native.get("snappyHexMesh", False) or wsl_results.get("snappyHexMesh", False),
+        "simpleFoam": native.get("simpleFoam", False) or wsl_results.get("simpleFoam", False),
+        "foamToVTK": native.get("foamToVTK", False) or wsl_results.get("foamToVTK", False),
         "wsl_outputs": wsl_outputs,
         "docker_outputs": docker_outputs,
     }
@@ -3381,11 +3339,6 @@ def run_openfoam_case(case_dir, run_solver=False):
     """
     Runs a body-fitted OpenFOAM workflow.
 
-    Supported runtimes:
-      - docker: runs inside the jewlz-openfoam OpenFOAM container on your PC
-      - wsl: runs inside WSL using a Linux-native temporary case folder
-      - native: runs OpenFOAM commands directly on the host PATH
-
     Stages:
       blockMesh
       surfaceFeatureExtract
@@ -3393,6 +3346,10 @@ def run_openfoam_case(case_dir, run_solver=False):
       checkMesh
       simpleFoam  [optional]
       foamToVTK -ascii [optional]
+
+    This makes the actual OpenFOAM fluid domain interact with the uploaded object.
+    Without snappyHexMesh, the solver only sees an empty rectangular box and the
+    uploaded object is only a visual overlay.
     """
     availability = openfoam_available()
     missing = [k for k in ["blockMesh", "snappyHexMesh", "simpleFoam"] if not availability.get(k, False)]
@@ -3418,13 +3375,13 @@ def run_openfoam_case(case_dir, run_solver=False):
             if mode == "docker":
                 ok, output = run_docker_openfoam_command(command, cwd_windows_path=case_dir, timeout=2400)
                 logs.append(
-                    f"$ docker OpenFOAM worker\n"
+                    f"$ docker OpenFOAM worker [Linux-native temp run]\n"
                     f"Container: {DOCKER_OPENFOAM_CONTAINER}\n"
-                    f"Image: {DOCKER_OPENFOAM_IMAGE}\n"
-                    f"Windows case: {case_dir}\n"
+                    f"Local case: {case_dir}\n"
                     f"Command: {command}\n"
                     f"{output}\n"
                 )
+
                 if (not ok) and required:
                     return False, "\n".join(logs)
 
@@ -3437,6 +3394,7 @@ def run_openfoam_case(case_dir, run_solver=False):
                     f"Command: {command}\n"
                     f"{output}\n"
                 )
+
                 if (not ok) and required:
                     return False, "\n".join(logs)
 
@@ -3451,6 +3409,7 @@ def run_openfoam_case(case_dir, run_solver=False):
                     timeout=2400,
                 )
                 logs.append(f"$ {command}\n{result.stdout}\n")
+
                 if result.returncode != 0 and required:
                     return False, "\n".join(logs)
 
@@ -7491,7 +7450,7 @@ def make_fluidforce_pdf_report(
 # Streamlit UI
 # -----------------------------
 st.title("Jewlz FluidForce Simulator")
-st.caption("Version V3.86 — Docker/OpenFOAM local worker support added for PC-based CFD execution. Supported uploads: STL, OBJ, PLY.")
+st.caption("Version V3.86 — Docker OpenFOAM local worker support added. Supported uploads: STL, OBJ, PLY.")
 init_job_db()
 
 with st.sidebar:
@@ -7885,7 +7844,8 @@ def render_openfoam_system_health(availability):
     """
     mode = str(availability.get("mode", "unknown")).upper()
     checks = [
-        ("Docker" if availability.get("mode") == "docker" else "OpenFOAM", availability.get("mode", "unknown") not in ["unknown", "unavailable", None, ""]),
+        ("Docker", bool(availability.get("docker", False)) if availability.get("mode") == "docker" else availability.get("mode", "unknown") in ["native", "wsl"]),
+        ("OpenFOAM", availability.get("mode", "unknown") not in ["unknown", None, "", "unavailable"]),
         ("blockMesh", bool(availability.get("blockMesh", False))),
         ("snappyHexMesh", bool(availability.get("snappyHexMesh", False))),
         ("simpleFoam", bool(availability.get("simpleFoam", False))),
@@ -7893,7 +7853,7 @@ def render_openfoam_system_health(availability):
     ]
 
     all_ready = all(ok for _, ok in checks)
-    overall_text = "OPENFOAM READY" if all_ready else "OPENFOAM / CFD WORKER NOT READY"
+    overall_text = "DOCKER OPENFOAM READY" if all_ready and availability.get("mode") == "docker" else ("OPENFOAM READY" if all_ready else "OPENFOAM ERROR")
 
     def light_html(ok):
         if ok:
@@ -7997,7 +7957,7 @@ def render_openfoam_system_health(availability):
 
     if not all_ready:
         missing = ", ".join(label for label, ok in checks if not ok)
-        st.error(f"OpenFOAM system check failed: {missing}. Start Docker Desktop and the {DOCKER_OPENFOAM_CONTAINER} container, or install/reconnect OpenFOAM/WSL before running CFD.")
+        st.error(f"OpenFOAM system check failed: {missing}. Start Docker container {DOCKER_OPENFOAM_CONTAINER} or reconnect OpenFOAM/WSL before running CFD.")
 
 
 
@@ -8014,18 +7974,18 @@ with tab4:
     render_openfoam_system_health(availability)
 
     if availability.get("mode") == "docker":
-        st.success(f"Docker OpenFOAM worker connected: {availability.get('container', DOCKER_OPENFOAM_CONTAINER)}")
+        st.success(f"Using local Docker/OpenFOAM worker: {availability.get('container', DOCKER_OPENFOAM_CONTAINER)}")
     elif availability.get("mode") == "unavailable":
         st.info(
-            "Cloud/frontend mode: the app can still run geometry checks, force estimates, design optimization, and PDF reports. "
-            "For true OpenFOAM CFD on your PC, start Docker Desktop and run/create the jewlz-openfoam container."
+            f"For local no-cost CFD, start the Docker worker in PowerShell: "
+            f"docker start -ai {DOCKER_OPENFOAM_CONTAINER}"
         )
 
     if DEVELOPER_MODE:
         with st.expander("OpenFOAM runtime note", expanded=False):
             st.info(
                 "In the future cloud version, these OpenFOAM commands will run on your CFD server. "
-                "The customer will only see Submit Job → Status → Results. On this prototype, OpenFOAM can run through Docker on your PC, WSL, or native OpenFOAM."
+                "The customer will only see Submit Job → Status → Results. On this Windows prototype, OpenFOAM runs through WSL."
             )
 
     if geom is None:
@@ -8044,7 +8004,7 @@ with tab4:
         run_case_after_generation = st.checkbox(
             "After generation, try running OpenFOAM locally",
             value=False,
-            help="Works when OpenFOAM is available natively, through WSL, or through the Docker container named jewlz-openfoam."
+            help="Only works if OpenFOAM is installed and available in this Python environment."
         )
 
         run_solver_after_meshing = st.checkbox(
