@@ -1,0 +1,14 @@
+{
+  "prepare": {
+    "cmd": "docker exec jewlz-openfoam bash -lc rm -rf /tmp/CFD-F0E4165F87 && mkdir -p /tmp/CFD-F0E4165F87",
+    "returncode": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  "copy_to_container": {
+    "cmd": "docker cp C:\\Users\\JOEL\\Desktop\\Jewlz tech\\Jewlz Fluid Dynamic force Simulator\\CFD App\\cfd_backend_jobs\\CFD-F0E4165F87\\unpacked\\CFD-AE4E2C1933 jewlz-openfoam:/tmp/CFD-F0E4165F87",
+    "returncode": 0,
+    "stdout": "",
+    "stderr": ""
+  }
+}

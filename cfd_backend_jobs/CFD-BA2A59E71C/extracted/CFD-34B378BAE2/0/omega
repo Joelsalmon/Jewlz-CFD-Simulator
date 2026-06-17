@@ -1,0 +1,52 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+| Jewlz FluidForce Simulator - Generated OpenFOAM Dictionary                  |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       volScalarField;
+    object      omega;
+}
+// ************************************************************************* //
+
+dimensions      [0 0 -1 0 0 0 0];
+
+internalField   uniform 1886.4465785282578;
+
+boundaryField
+{
+    xMax
+    {
+        type fixedValue;
+        value uniform 1886.4465785282578;
+    }
+
+    xMin
+    {
+        type zeroGradient;
+    }
+
+    yMin
+    {
+        type zeroGradient;
+    }
+    yMax
+    {
+        type zeroGradient;
+    }
+    zMin
+    {
+        type zeroGradient;
+    }
+    zMax
+    {
+        type zeroGradient;
+    }
+
+    object
+    {
+        type omegaWallFunction;
+        value uniform 1886.4465785282578;
+    }
+}

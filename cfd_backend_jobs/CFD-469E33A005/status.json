@@ -1,0 +1,10 @@
+{
+  "job_id": "CFD-469E33A005",
+  "status": "completed",
+  "progress": 100,
+  "message": "CFD job completed successfully.",
+  "notes": "",
+  "created_at": 1781720134.1596472,
+  "updated_at": 1781720141.9609122,
+  "vtk_available": true
+}

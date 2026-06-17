@@ -1,0 +1,44 @@
+/*---------------------------------------------------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\    /   O peration     | Version:  2512                                  |
+|   \\  /    A nd           | Website:  www.openfoam.com                      |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+Build  : _87ed40d2-20251219 OPENFOAM=2512 version=2512
+Arch   : "LSB;label=32;scalar=64"
+Exec   : foamToVTK
+Date   : Jun 17 2026
+Time   : 18:33:27
+Host   : 6bbf64af3d00
+PID    : 15829
+I/O    : uncollated
+Case   : /tmp/CFD-3CDD380269
+nProcs : 1
+trapFpe: Floating point exception trapping enabled (FOAM_SIGFPE).
+memory pool : not available
+fileModificationChecking : Monitoring run-time modified files using timeStampMaster (fileModificationSkew 5, maxFileModificationPolls 20)
+allowSystemOperations : Allowing user-supplied system call operations
+
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+Create time
+
+Initial memory 125120 kB
+Create mesh for time = 0
+
+VTK mesh topology: 0.2 s, 145760 kB
+Time: 0
+    volScalar    : epsilon k nut omega p
+    volVector    : U
+    Internal  : "VTK/CFD-3CDD380269_0/internal.vtu"
+    Boundary  : "VTK/CFD-3CDD380269_0/boundary/xMin.vtp"
+    Boundary  : "VTK/CFD-3CDD380269_0/boundary/xMax.vtp"
+    Boundary  : "VTK/CFD-3CDD380269_0/boundary/yMin.vtp"
+    Boundary  : "VTK/CFD-3CDD380269_0/boundary/yMax.vtp"
+    Boundary  : "VTK/CFD-3CDD380269_0/boundary/zMin.vtp"
+    Boundary  : "VTK/CFD-3CDD380269_0/boundary/zMax.vtp"
+    Boundary  : "VTK/CFD-3CDD380269_0/boundary/object.vtp"
+Wrote in 0.28 s, 217188 kB
+
+End: 0.48 s, 220052 kB (peak)
+

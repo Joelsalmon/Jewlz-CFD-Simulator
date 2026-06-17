@@ -1,0 +1,10 @@
+{
+  "job_id": "CFD-031EAAA5FE",
+  "status": "completed",
+  "progress": 100,
+  "message": "CFD job completed successfully.",
+  "notes": "Standard CFD Mode, Air, V=30.0 m/s, front=+X front",
+  "created_at": 1781723533.2999196,
+  "updated_at": 1781723541.1016948,
+  "vtk_available": true
+}
