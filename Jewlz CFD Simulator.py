@@ -8044,46 +8044,115 @@ def _remote_array(values, default=None):
         return default
 
 
-def make_remote_cfd_field_figure(visual_payload, field_key, title, colorbar_title, object_opacity=0.55, max_points=45000):
-    """Create a Plotly 3D figure from backend-generated cfd_visual_mesh.json."""
+def _filter_remote_points_near_object_surface(points, field, vertices=None, max_points=9000, contact_fraction=0.18):
+    """
+    Reduce the OpenFOAM volume field to the region closest to the uploaded object.
+    This prevents Streamlit/Plotly timeouts and focuses the customer visual on the
+    pressure/velocity gradients that are actually interacting with the object surface.
+    """
+    points = np.asarray(points, dtype=float)
+    field = np.asarray(field, dtype=float)
+
+    if points.ndim != 2 or points.shape[1] < 3 or field.size != len(points):
+        return points, field
+
+    max_points = int(max(1500, max_points))
+    contact_fraction = float(np.clip(contact_fraction, 0.03, 0.75))
+
+    if vertices is None:
+        if len(points) > max_points:
+            idx = np.linspace(0, len(points) - 1, max_points).astype(int)
+            return points[idx], field[idx]
+        return points, field
+
+    vertices = np.asarray(vertices, dtype=float)
+    if vertices.ndim != 2 or vertices.shape[1] < 3 or len(vertices) < 3:
+        if len(points) > max_points:
+            idx = np.linspace(0, len(points) - 1, max_points).astype(int)
+            return points[idx], field[idx]
+        return points, field
+
+    # First crop around the object's bounding box so we do not show the entire CFD domain.
+    vmin = np.nanmin(vertices[:, :3], axis=0)
+    vmax = np.nanmax(vertices[:, :3], axis=0)
+    span = np.maximum(vmax - vmin, 1e-9)
+    pad = 0.45 * np.max(span)
+    near_box = np.all((points[:, :3] >= (vmin - pad)) & (points[:, :3] <= (vmax + pad)), axis=1)
+    candidate_idx = np.where(near_box)[0]
+    if candidate_idx.size < 100:
+        candidate_idx = np.arange(len(points))
+
+    candidate_points = points[candidate_idx, :3]
+
+    # Sample object vertices for a fast nearest-surface estimate.
+    max_surface_samples = 1200
+    if len(vertices) > max_surface_samples:
+        v_idx = np.linspace(0, len(vertices) - 1, max_surface_samples).astype(int)
+        surface_sample = vertices[v_idx, :3]
+    else:
+        surface_sample = vertices[:, :3]
+
+    nearest = np.full(candidate_points.shape[0], np.inf, dtype=float)
+    chunk = 2000
+    for s in range(0, candidate_points.shape[0], chunk):
+        cp = candidate_points[s:s + chunk]
+        # squared nearest distance to sampled object surface vertices
+        d2 = ((cp[:, None, :] - surface_sample[None, :, :]) ** 2).sum(axis=2)
+        nearest[s:s + chunk] = np.sqrt(np.nanmin(d2, axis=1))
+
+    keep_n = min(max_points, max(1000, int(candidate_idx.size * contact_fraction)))
+    keep_local = np.argsort(nearest)[:keep_n]
+    keep_idx = candidate_idx[keep_local]
+
+    # Sort by coordinate for deterministic plots and stable PDF exports.
+    keep_idx = keep_idx[np.argsort(points[keep_idx, 0])]
+    return points[keep_idx], field[keep_idx]
+
+
+def make_remote_cfd_field_figure(
+    visual_payload,
+    field_key,
+    title,
+    colorbar_title,
+    object_opacity=0.62,
+    max_points=9000,
+    near_surface_only=True,
+):
+    """Create a lightweight near-surface Plotly 3D figure from backend cfd_visual_mesh.json."""
     points = _remote_array(visual_payload.get("points"))
     field = _remote_array(visual_payload.get(field_key))
     if points is None or points.ndim != 2 or points.shape[1] < 3:
         return None, "Remote CFD visual JSON does not contain usable 3D points."
     if field is None or len(field) != len(points):
         return None, f"Remote CFD visual JSON does not contain usable {field_key} values."
-    n = len(points)
-    if n > max_points:
-        idx = np.linspace(0, n - 1, max_points).astype(int)
-        points_plot = points[idx]
-        field_plot = field[idx]
-    else:
-        points_plot = points
-        field_plot = field
-    fig = go.Figure()
-    fig.add_trace(
-        go.Scatter3d(
-            x=points_plot[:, 0],
-            y=points_plot[:, 1],
-            z=points_plot[:, 2],
-            mode="markers",
-            marker=dict(
-                size=2,
-                color=field_plot,
-                colorscale="Turbo",
-                colorbar=dict(title=colorbar_title),
-                showscale=True,
-            ),
-            text=[f"{colorbar_title}: {v:.6g}" for v in field_plot],
-            hovertemplate="x=%{x:.6g}<br>y=%{y:.6g}<br>z=%{z:.6g}<br>%{text}<extra></extra>",
-            name=colorbar_title,
-        )
-    )
+
     obj = visual_payload.get("object_mesh") or {}
     vertices = _remote_array(obj.get("vertices"))
     i = obj.get("i")
     j = obj.get("j")
     k = obj.get("k")
+
+    if near_surface_only:
+        points_plot, field_plot = _filter_remote_points_near_object_surface(
+            points,
+            field,
+            vertices=vertices,
+            max_points=max_points,
+            contact_fraction=0.16,
+        )
+    else:
+        n = len(points)
+        if n > max_points:
+            idx = np.linspace(0, n - 1, max_points).astype(int)
+            points_plot = points[idx]
+            field_plot = field[idx]
+        else:
+            points_plot = points
+            field_plot = field
+
+    fig = go.Figure()
+
+    # Object first, so near-surface CFD contact points remain visible on top.
     if vertices is not None and vertices.ndim == 2 and vertices.shape[1] >= 3 and i and j and k:
         fig.add_trace(
             go.Mesh3d(
@@ -8095,8 +8164,9 @@ def make_remote_cfd_field_figure(visual_payload, field_key, title, colorbar_titl
                 k=k,
                 color="lightgray",
                 opacity=object_opacity,
-                name="Uploaded object",
+                name="Uploaded object surface",
                 showscale=False,
+                hovertemplate="Uploaded object surface<extra></extra>",
             )
         )
     elif vertices is not None and vertices.ndim == 2 and vertices.shape[1] >= 3:
@@ -8107,23 +8177,56 @@ def make_remote_cfd_field_figure(visual_payload, field_key, title, colorbar_titl
                 z=vertices[:, 2],
                 mode="markers",
                 marker=dict(size=3, color="black"),
-                name="Uploaded object",
+                name="Uploaded object surface",
+                hovertemplate="Uploaded object surface<extra></extra>",
             )
         )
+
+    fig.add_trace(
+        go.Scatter3d(
+            x=points_plot[:, 0],
+            y=points_plot[:, 1],
+            z=points_plot[:, 2],
+            mode="markers",
+            marker=dict(
+                size=2.8,
+                color=field_plot,
+                colorscale="Turbo",
+                colorbar=dict(title=colorbar_title),
+                showscale=True,
+                opacity=0.78,
+            ),
+            text=[f"{colorbar_title}: {v:.6g}" for v in field_plot],
+            hovertemplate="x=%{x:.6g}<br>y=%{y:.6g}<br>z=%{z:.6g}<br>%{text}<extra></extra>",
+            name=f"Near-surface {colorbar_title}",
+        )
+    )
+
     meta = visual_payload.get("metadata", {}) or {}
     fmin = float(np.nanmin(field))
     fmax = float(np.nanmax(field))
     fmean = float(np.nanmean(field))
+    plot_min = float(np.nanmin(field_plot)) if len(field_plot) else fmin
+    plot_max = float(np.nanmax(field_plot)) if len(field_plot) else fmax
+    plot_mean = float(np.nanmean(field_plot)) if len(field_plot) else fmean
+
+    subtitle = "Near-surface contact region only" if near_surface_only else "Full sampled CFD field"
     fig.update_layout(
-        title=title,
+        title=f"{title}<br><sup>{subtitle}; showing {len(points_plot):,} of {len(points):,} OpenFOAM field points</sup>",
         scene=dict(xaxis_title="X [m]", yaxis_title="Y [m]", zaxis_title="Z [m]", aspectmode="data"),
-        margin=dict(l=0, r=0, t=55, b=0),
-        height=760,
+        margin=dict(l=0, r=0, t=70, b=0),
+        height=640,
         meta={
             "field_min": fmin,
             "field_max": fmax,
             "field_mean": fmean,
             "field_delta": fmax - fmin,
+            "plot_min": plot_min,
+            "plot_max": plot_max,
+            "plot_mean": plot_mean,
+            "plot_delta": plot_max - plot_min,
+            "shown_points": int(len(points_plot)),
+            "total_points": int(len(points)),
             "source_vtu": meta.get("source_vtu", ""),
             "object_surface": meta.get("object_surface", ""),
         },
@@ -8148,8 +8251,9 @@ def render_remote_cfd_visuals_from_zip(zip_bytes, job_id):
         return
     payload = json.loads(visual_json.read_text(encoding="utf-8", errors="ignore"))
     meta = payload.get("metadata", {}) or {}
-    st.subheader("Remote OpenFOAM 3D Results")
+    st.subheader("Remote OpenFOAM 3D Near-Surface Results")
     st.caption(f"Remote CFD visual JSON loaded: {visual_json}")
+    st.info("To prevent browser timeouts, the 3D views show only OpenFOAM pressure/velocity points closest to the uploaded object surface. Full solved data remains in the downloaded ZIP.")
     if meta.get("source_vtu"):
         st.caption(f"Docker-generated OpenFOAM VTU source: {meta.get('source_vtu')}")
     if meta.get("object_surface"):
@@ -8169,10 +8273,18 @@ def render_remote_cfd_visuals_from_zip(zip_bytes, job_id):
         st.plotly_chart(fig, use_container_width=True)
         fmeta = fig.layout.meta or {}
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Min", f"{fmeta.get('field_min', 0):.6g}")
-        c2.metric("Max", f"{fmeta.get('field_max', 0):.6g}")
-        c3.metric("Mean", f"{fmeta.get('field_mean', 0):.6g}")
-        c4.metric("Range", f"{fmeta.get('field_delta', 0):.6g}")
+        c1.metric("Surface-view min", f"{fmeta.get('plot_min', 0):.6g}")
+        c2.metric("Surface-view max", f"{fmeta.get('plot_max', 0):.6g}")
+        c3.metric("Surface-view range", f"{fmeta.get('plot_delta', 0):.6g}")
+        c4.metric("Points shown", f"{int(fmeta.get('shown_points', 0)):,}")
+        with st.expander("Full OpenFOAM field statistics"):
+            st.write({
+                "full_field_min": fmeta.get("field_min", 0),
+                "full_field_max": fmeta.get("field_max", 0),
+                "full_field_mean": fmeta.get("field_mean", 0),
+                "full_field_range": fmeta.get("field_delta", 0),
+                "total_points_in_json": fmeta.get("total_points", 0),
+            })
         try:
             if label == "Pressure":
                 cache_cfd_report_visual(
