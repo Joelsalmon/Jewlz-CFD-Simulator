@@ -1,0 +1,10 @@
+streamlit
+numpy
+pandas
+plotly
+kaleido
+reportlab
+trimesh
+pillow
+scipy
+coolprop
