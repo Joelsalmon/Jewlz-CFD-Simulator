@@ -351,10 +351,67 @@ def generate_cfd_visual_assets(results_dir: Path, logs: dict, max_points: int = 
             assets["message"] = "All extracted CFD field points were non-finite."
             return assets
 
+
+
+        def estimate_gradient_magnitude_xyz(points_xyz, values, k_neighbors=12, max_calc_points=18000):
+            """
+            Estimate |grad(field)| from scattered CFD points using local least-squares planes.
+            Units follow the field divided by meters, e.g. Pa/m or (m/s)/m.
+            """
+            points_xyz = np.asarray(points_xyz, dtype=float)
+            values = np.asarray(values, dtype=float).reshape(-1)
+            npts = min(len(points_xyz), len(values))
+            if npts < 5:
+                return np.zeros(npts, dtype=float)
+            points_xyz = points_xyz[:npts]
+            values = values[:npts]
+            finite2 = np.isfinite(points_xyz).all(axis=1) & np.isfinite(values)
+            out = np.zeros(npts, dtype=float)
+            if finite2.sum() < 5:
+                return out
+            pfin = points_xyz[finite2]
+            vfin = values[finite2]
+            try:
+                from scipy.spatial import cKDTree
+                tree = cKDTree(pfin)
+                # Cap calculation size for backend responsiveness.
+                if len(pfin) > max_calc_points:
+                    calc_idx = np.linspace(0, len(pfin) - 1, max_calc_points).astype(int)
+                else:
+                    calc_idx = np.arange(len(pfin))
+                grad_fin = np.zeros(len(pfin), dtype=float)
+                kq = max(4, min(int(k_neighbors), len(pfin)))
+                for ii in calc_idx:
+                    _, neigh = tree.query(pfin[ii], k=kq)
+                    neigh = np.atleast_1d(neigh).astype(int)
+                    X = pfin[neigh] - pfin[ii]
+                    y = vfin[neigh] - vfin[ii]
+                    # Least-squares gradient vector: X @ grad ~= y
+                    g, *_ = np.linalg.lstsq(X, y, rcond=None)
+                    grad_fin[ii] = float(np.linalg.norm(g[:3]))
+                if len(pfin) > max_calc_points:
+                    # Interpolate gradient values back to all finite points from calculated subset.
+                    calc_tree = cKDTree(pfin[calc_idx])
+                    _, nearest = calc_tree.query(pfin, k=1)
+                    grad_fin = grad_fin[calc_idx][nearest]
+                out[np.where(finite2)[0]] = grad_fin
+                return out
+            except Exception:
+                # Fallback: radial finite-difference proxy from centroid.
+                centroid = np.nanmean(points_xyz, axis=0)
+                r = np.linalg.norm(points_xyz - centroid, axis=1)
+                dr = np.nanmax(r) - np.nanmin(r)
+                dv = np.nanmax(values) - np.nanmin(values)
+                proxy = abs(dv / dr) if dr > 1e-12 else 0.0
+                return np.full(npts, proxy, dtype=float)
+
         idx = _sample_indices(len(cloud_points), max_points=max_points)
         cloud_points = np.asarray(cloud_points[idx], dtype=float)
         pressure = np.asarray(pressure[idx], dtype=float)
         velocity_mag = np.asarray(velocity_mag[idx], dtype=float)
+
+        pressure_gradient_mag = estimate_gradient_magnitude_xyz(cloud_points, pressure)
+        velocity_gradient_mag = estimate_gradient_magnitude_xyz(cloud_points, velocity_mag)
 
         object_surface_path = find_latest_object_surface(results_dir)
         object_mesh = extract_object_mesh_for_json(object_surface_path, pv, np, max_faces=25000)
@@ -364,6 +421,8 @@ def generate_cfd_visual_assets(results_dir: Path, logs: dict, max_points: int = 
             "points": cloud_points.tolist(),
             "pressure": pressure.tolist(),
             "velocity_magnitude": velocity_mag.tolist(),
+            "pressure_gradient_magnitude": pressure_gradient_mag.tolist(),
+            "velocity_gradient_magnitude": velocity_gradient_mag.tolist(),
             "object_mesh": object_mesh,
             "metadata": {
                 "source_vtu": str(vtu_path),
@@ -374,8 +433,16 @@ def generate_cfd_visual_assets(results_dir: Path, logs: dict, max_points: int = 
                 "n_points": int(len(cloud_points)),
                 "pressure_min": float(np.nanmin(pressure)) if len(pressure) else 0.0,
                 "pressure_max": float(np.nanmax(pressure)) if len(pressure) else 0.0,
+                "pressure_mean": float(np.nanmean(pressure)) if len(pressure) else 0.0,
+                "pressure_gradient_min": float(np.nanmin(pressure_gradient_mag)) if len(pressure_gradient_mag) else 0.0,
+                "pressure_gradient_max": float(np.nanmax(pressure_gradient_mag)) if len(pressure_gradient_mag) else 0.0,
+                "pressure_gradient_mean": float(np.nanmean(pressure_gradient_mag)) if len(pressure_gradient_mag) else 0.0,
                 "velocity_min": float(np.nanmin(velocity_mag)) if len(velocity_mag) else 0.0,
                 "velocity_max": float(np.nanmax(velocity_mag)) if len(velocity_mag) else 0.0,
+                "velocity_mean": float(np.nanmean(velocity_mag)) if len(velocity_mag) else 0.0,
+                "velocity_gradient_min": float(np.nanmin(velocity_gradient_mag)) if len(velocity_gradient_mag) else 0.0,
+                "velocity_gradient_max": float(np.nanmax(velocity_gradient_mag)) if len(velocity_gradient_mag) else 0.0,
+                "velocity_gradient_mean": float(np.nanmean(velocity_gradient_mag)) if len(velocity_gradient_mag) else 0.0,
                 "object_surface": str(object_surface_path) if object_surface_path else "",
                 "object_mesh_available": bool(object_mesh and not object_mesh.get("error")),
             },
