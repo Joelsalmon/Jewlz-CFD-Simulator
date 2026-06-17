@@ -298,11 +298,25 @@ def health(x_api_key: Optional[str] = Header(default=None)):
         timeout=20,
     )
 
+    try:
+        import meshio  # noqa: F401
+        meshio_ok = True
+    except Exception as e:
+        meshio_ok = str(e)
+
+    try:
+        import matplotlib  # noqa: F401
+        matplotlib_ok = True
+    except Exception as e:
+        matplotlib_ok = str(e)
+
     return {
         "backend": "ready",
         "docker": docker_ok["returncode"] == 0,
         "openfoam_container": OPENFOAM_CONTAINER,
         "openfoam_ready": foam_check["returncode"] == 0,
+        "meshio": meshio_ok,
+        "matplotlib": matplotlib_ok,
         "openfoam_check_stdout": foam_check["stdout"],
         "openfoam_check_stderr": foam_check["stderr"],
     }
@@ -537,6 +551,14 @@ async def run_case_zip(
         status.update(progress=94, message="Generating backend 3D visual assets.")
         write_status(job_dir, status)
         logs["visual_assets"] = generate_cfd_visual_assets(results_dir, logs)
+
+        logs["visual_asset_files"] = []
+        for root, dirs, files in os.walk(results_dir):
+            for f in files:
+                if f.endswith(".json") or f.endswith(".png"):
+                    logs["visual_asset_files"].append(
+                        os.path.join(root, f)
+                    )
 
         (job_dir / "openfoam_logs.json").write_text(
             json.dumps(logs, indent=2),
