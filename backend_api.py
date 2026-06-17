@@ -150,15 +150,15 @@ def _sample_indices(n: int, max_points: int = 60000):
 
 def generate_cfd_visual_assets(results_dir: Path, logs: dict, max_points: int = 60000):
     """
-    Backend-side VTU parsing.
+    Backend-side VTU parsing using PyVista/VTK.
 
     Creates:
       - cfd_visual_mesh.json for Streamlit interactive 3D Plotly
       - pressure_visual.png for PDF report
       - velocity_visual.png for PDF report
 
-    Streamlit should display the JSON-based 3D visualization and use PNGs only
-    when exporting/embedding the PDF report.
+    PyVista is used instead of meshio because OpenFOAM foamToVTK can produce
+    polyhedra/mixed-cell VTU files that meshio cannot load reliably.
     """
     assets = {"created": False, "message": ""}
     vtu_path = find_latest_internal_vtu(results_dir)
@@ -168,65 +168,88 @@ def generate_cfd_visual_assets(results_dir: Path, logs: dict, max_points: int = 
 
     try:
         import numpy as np
-        import meshio
+        import pyvista as pv
     except Exception as e:
-        assets["message"] = f"meshio/numpy unavailable on backend: {e}"
+        assets["message"] = f"pyvista/numpy unavailable on backend: {e}"
         return assets
 
     try:
-        mesh = meshio.read(str(vtu_path))
-        points = np.asarray(mesh.points, dtype=float)
-        if points.ndim != 2 or points.shape[1] < 3 or len(points) == 0:
-            assets["message"] = "VTU contains no usable points."
+        mesh = pv.read(str(vtu_path))
+        assets["vtu_path"] = str(vtu_path)
+        assets["mesh_type"] = type(mesh).__name__
+        assets["n_points"] = int(getattr(mesh, "n_points", 0))
+        assets["n_cells"] = int(getattr(mesh, "n_cells", 0))
+        assets["point_arrays"] = list(mesh.point_data.keys())
+        assets["cell_arrays"] = list(mesh.cell_data.keys())
+
+        if mesh.n_points <= 0 and mesh.n_cells <= 0:
+            assets["message"] = "VTU contains no usable points or cells."
             return assets
-        points = points[:, :3]
 
-        point_pressure = None
-        point_velocity = None
-        if "p" in mesh.point_data:
-            point_pressure = np.asarray(mesh.point_data["p"], dtype=float).reshape(-1)
-        if "U" in mesh.point_data:
-            point_velocity = np.asarray(mesh.point_data["U"], dtype=float)
+        def _as_vector_magnitude(arr):
+            arr = np.asarray(arr, dtype=float)
+            if arr.ndim == 2 and arr.shape[1] >= 3:
+                return np.linalg.norm(arr[:, :3], axis=1)
+            return np.abs(arr).reshape(-1)
 
-        centers = None
-        cell_pressure = None
-        cell_velocity = None
-
-        # Many OpenFOAM foamToVTK files store fields as cell_data.
-        for block_i, block in enumerate(mesh.cells):
-            cell_conn = np.asarray(block.data, dtype=int)
-            if cell_conn.size == 0:
-                continue
-            # Use first substantial cell block.
-            centers = points[cell_conn].mean(axis=1)
-            try:
-                if "p" in mesh.cell_data:
-                    cell_pressure = np.asarray(mesh.cell_data["p"][block_i], dtype=float).reshape(-1)
-                if "U" in mesh.cell_data:
-                    cell_velocity = np.asarray(mesh.cell_data["U"][block_i], dtype=float)
-            except Exception:
-                pass
-            if centers is not None and len(centers) > 0:
-                break
-
-        if point_pressure is not None or point_velocity is not None:
-            cloud_points = points
-            pressure = point_pressure if point_pressure is not None and len(point_pressure) == len(points) else np.zeros(len(points))
-            if point_velocity is not None and len(point_velocity) == len(points):
-                velocity_mag = np.linalg.norm(point_velocity[:, :3], axis=1) if point_velocity.ndim == 2 else np.abs(point_velocity)
+        # Prefer point data when available. Otherwise use cell centers for OpenFOAM cell data.
+        if "p" in mesh.point_data or "U" in mesh.point_data:
+            cloud_points = np.asarray(mesh.points, dtype=float)[:, :3]
+            if "p" in mesh.point_data:
+                pressure = np.asarray(mesh.point_data["p"], dtype=float).reshape(-1)
             else:
-                velocity_mag = np.zeros(len(points))
+                pressure = np.zeros(len(cloud_points), dtype=float)
+
+            if "U" in mesh.point_data:
+                velocity_mag = _as_vector_magnitude(mesh.point_data["U"])
+            else:
+                velocity_mag = np.zeros(len(cloud_points), dtype=float)
+
             source_kind = "point_data"
-        elif centers is not None and len(centers) > 0:
-            cloud_points = centers
-            pressure = cell_pressure if cell_pressure is not None and len(cell_pressure) == len(centers) else np.zeros(len(centers))
-            if cell_velocity is not None and len(cell_velocity) == len(centers):
-                velocity_mag = np.linalg.norm(cell_velocity[:, :3], axis=1) if cell_velocity.ndim == 2 else np.abs(cell_velocity)
+
+        elif "p" in mesh.cell_data or "U" in mesh.cell_data:
+            centers = mesh.cell_centers()
+            cloud_points = np.asarray(centers.points, dtype=float)[:, :3]
+            if "p" in mesh.cell_data:
+                pressure = np.asarray(mesh.cell_data["p"], dtype=float).reshape(-1)
             else:
-                velocity_mag = np.zeros(len(centers))
+                pressure = np.zeros(len(cloud_points), dtype=float)
+
+            if "U" in mesh.cell_data:
+                velocity_mag = _as_vector_magnitude(mesh.cell_data["U"])
+            else:
+                velocity_mag = np.zeros(len(cloud_points), dtype=float)
+
             source_kind = "cell_data_centers"
         else:
-            assets["message"] = "No usable point_data or cell_data fields found in VTU."
+            # Last-resort: display mesh geometry with zero field values.
+            if mesh.n_cells > 0:
+                centers = mesh.cell_centers()
+                cloud_points = np.asarray(centers.points, dtype=float)[:, :3]
+            else:
+                cloud_points = np.asarray(mesh.points, dtype=float)[:, :3]
+            pressure = np.zeros(len(cloud_points), dtype=float)
+            velocity_mag = np.zeros(len(cloud_points), dtype=float)
+            source_kind = "geometry_only_no_p_or_U"
+            assets["field_warning"] = "No p or U arrays found in point_data/cell_data; generated geometry-only visualization."
+
+        n = min(len(cloud_points), len(pressure), len(velocity_mag))
+        if n <= 0:
+            assets["message"] = "No usable cloud points after field extraction."
+            return assets
+
+        cloud_points = cloud_points[:n]
+        pressure = pressure[:n]
+        velocity_mag = velocity_mag[:n]
+
+        # Remove non-finite values so Plotly/matplotlib do not fail.
+        finite = np.isfinite(cloud_points).all(axis=1) & np.isfinite(pressure) & np.isfinite(velocity_mag)
+        cloud_points = cloud_points[finite]
+        pressure = pressure[finite]
+        velocity_mag = velocity_mag[finite]
+
+        if len(cloud_points) == 0:
+            assets["message"] = "All extracted CFD field points were non-finite."
             return assets
 
         idx = _sample_indices(len(cloud_points), max_points=max_points)
@@ -242,6 +265,9 @@ def generate_cfd_visual_assets(results_dir: Path, logs: dict, max_points: int = 
             "metadata": {
                 "source_vtu": str(vtu_path),
                 "source_kind": source_kind,
+                "mesh_type": type(mesh).__name__,
+                "point_arrays": list(mesh.point_data.keys()),
+                "cell_arrays": list(mesh.cell_data.keys()),
                 "n_points": int(len(cloud_points)),
                 "pressure_min": float(np.nanmin(pressure)) if len(pressure) else 0.0,
                 "pressure_max": float(np.nanmax(pressure)) if len(pressure) else 0.0,
@@ -251,7 +277,7 @@ def generate_cfd_visual_assets(results_dir: Path, logs: dict, max_points: int = 
         }
         json_path.write_text(json.dumps(payload), encoding="utf-8")
 
-        # PDF-only PNGs. Do not rely on these for Streamlit 3D display.
+        # PDF-only PNGs. Streamlit still uses cfd_visual_mesh.json for interactive 3D.
         try:
             import matplotlib
             matplotlib.use("Agg")
@@ -281,10 +307,10 @@ def generate_cfd_visual_assets(results_dir: Path, logs: dict, max_points: int = 
         except Exception as e:
             assets["png_warning"] = str(e)
 
-        assets.update({"created": True, "json": str(json_path), "message": "Backend CFD visual assets created."})
+        assets.update({"created": True, "json": str(json_path), "message": "Backend CFD visual assets created with PyVista."})
         return assets
     except Exception as e:
-        assets["message"] = f"Backend CFD visual asset generation failed: {e}"
+        assets["message"] = f"Backend CFD visual asset generation failed with PyVista: {e}"
         return assets
 
 @app.get("/health")
@@ -310,6 +336,18 @@ def health(x_api_key: Optional[str] = Header(default=None)):
     except Exception as e:
         matplotlib_ok = str(e)
 
+    try:
+        import pyvista  # noqa: F401
+        pyvista_ok = True
+    except Exception as e:
+        pyvista_ok = str(e)
+
+    try:
+        import vtk  # noqa: F401
+        vtk_ok = True
+    except Exception as e:
+        vtk_ok = str(e)
+
     return {
         "backend": "ready",
         "docker": docker_ok["returncode"] == 0,
@@ -317,6 +355,8 @@ def health(x_api_key: Optional[str] = Header(default=None)):
         "openfoam_ready": foam_check["returncode"] == 0,
         "meshio": meshio_ok,
         "matplotlib": matplotlib_ok,
+        "pyvista": pyvista_ok,
+        "vtk": vtk_ok,
         "openfoam_check_stdout": foam_check["stdout"],
         "openfoam_check_stderr": foam_check["stderr"],
     }
