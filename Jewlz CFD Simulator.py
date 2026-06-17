@@ -8,12 +8,12 @@ import os
 import re
 import shutil
 import subprocess
+import requests
 import zipfile
 import sqlite3
 import json
 import base64
 import uuid
-import requests
 from datetime import datetime
 from pathlib import Path
 from io import BytesIO
@@ -3334,90 +3334,6 @@ def zip_directory(source_dir, zip_path):
                 zf.write(file, file.relative_to(source_dir.parent))
 
     return zip_path
-
-
-
-
-def get_remote_cfd_backend_config():
-    """
-    Reads Streamlit secrets for the remote Jewlz CFD backend.
-    Returns (backend_available, backend_url, backend_api_key).
-    """
-    backend_url = ""
-    backend_api_key = ""
-    try:
-        backend_url = str(st.secrets.get("CFD_BACKEND_URL", "") or "").strip().rstrip("/")
-        backend_api_key = str(st.secrets.get("CFD_BACKEND_API_KEY", "") or "").strip()
-    except Exception:
-        backend_url = ""
-        backend_api_key = ""
-    return bool(backend_url and backend_api_key), backend_url, backend_api_key
-
-
-def submit_case_zip_to_remote_backend(job_id, zip_path, backend_url, backend_api_key, notes=""):
-    """
-    Sends the generated OpenFOAM case ZIP to the remote FastAPI backend.
-
-    The backend endpoint used by the current Docker/OpenFOAM worker is:
-        POST /run_case_zip
-    """
-    zip_path = Path(zip_path)
-    if not zip_path.exists():
-        return False, f"Case ZIP not found: {zip_path}", None, {}
-
-    headers = {"x-api-key": backend_api_key}
-
-    try:
-        with open(zip_path, "rb") as f:
-            files = {"case_zip": (zip_path.name, f, "application/zip")}
-            data = {"job_id": job_id, "notes": notes or ""}
-
-            response = requests.post(
-                f"{backend_url}/run_case_zip",
-                headers=headers,
-                files=files,
-                data=data,
-                timeout=1800,
-            )
-    except Exception as e:
-        return False, f"Remote backend request failed: {e}", None, {}
-
-    if response.status_code != 200:
-        body_preview = response.text[:1000] if getattr(response, "text", None) else ""
-        return False, f"Remote backend returned HTTP {response.status_code}: {body_preview}", None, {}
-
-    result_dir = app_data_dir() / "remote_results"
-    result_dir.mkdir(parents=True, exist_ok=True)
-    solved_zip_path = result_dir / f"{job_id}_remote_solved.zip"
-
-    content_type = response.headers.get("content-type", "").lower()
-
-    if "application/zip" in content_type or response.content[:2] == b"PK":
-        solved_zip_path.write_bytes(response.content)
-        return True, "Remote OpenFOAM CFD completed. Solved case ZIP downloaded from backend.", str(solved_zip_path), {
-            "response_type": "zip",
-            "content_type": content_type,
-        }
-
-    try:
-        payload = response.json()
-    except Exception:
-        return False, f"Remote backend returned non-ZIP, non-JSON response: {response.text[:1000]}", None, {
-            "content_type": content_type,
-        }
-
-    for key in ("zip_base64", "solved_zip_base64", "case_zip_base64", "download_zip_base64"):
-        if payload.get(key):
-            try:
-                solved_zip_path.write_bytes(base64.b64decode(payload[key]))
-                return True, "Remote OpenFOAM CFD completed. Solved case ZIP decoded from backend JSON.", str(solved_zip_path), payload
-            except Exception as e:
-                return False, f"Remote backend returned {key}, but it could not be decoded: {e}", None, payload
-
-    if payload.get("status") in ("complete", "completed", "success", "ok") or payload.get("ok") is True:
-        return True, "Remote OpenFOAM CFD completed. Backend returned JSON status.", None, payload
-
-    return False, f"Remote backend returned JSON but did not include a solved ZIP. Payload: {json.dumps(payload)[:1200]}", None, payload
 
 
 def run_openfoam_case(case_dir, run_solver=False):
@@ -8046,6 +7962,243 @@ def render_openfoam_system_health(availability):
 
 
 
+
+# =====================================================
+# Remote Jewlz CFD backend helpers
+# =====================================================
+def get_remote_cfd_backend_config():
+    """Read remote backend settings from Streamlit secrets."""
+    backend_url = ""
+    backend_api_key = ""
+    try:
+        backend_url = str(st.secrets.get("CFD_BACKEND_URL", "")).strip().rstrip("/")
+        backend_api_key = str(st.secrets.get("CFD_BACKEND_API_KEY", "")).strip()
+    except Exception:
+        backend_url = ""
+        backend_api_key = ""
+    return backend_url, backend_api_key, bool(backend_url and backend_api_key)
+
+
+def post_case_zip_to_remote_backend(backend_url, backend_api_key, case_zip_path, job_id, notes=""):
+    """Send a generated OpenFOAM case ZIP to the FastAPI backend and return solved ZIP bytes."""
+    headers = {"x-api-key": backend_api_key, "X-API-Key": backend_api_key}
+    with open(case_zip_path, "rb") as f:
+        data = {"job_id": job_id, "notes": notes or ""}
+        try:
+            f.seek(0)
+            response = requests.post(
+                f"{backend_url}/run_case_zip",
+                files={"case_zip": (Path(case_zip_path).name, f, "application/zip")},
+                data=data,
+                headers=headers,
+                timeout=1800,
+            )
+            if response.status_code == 404:
+                raise RuntimeError("Endpoint /run_case_zip was not found.")
+        except Exception:
+            f.seek(0)
+            response = requests.post(
+                f"{backend_url}/submit_case_zip",
+                files={"case_zip": (Path(case_zip_path).name, f, "application/zip")},
+                data=data,
+                headers=headers,
+                timeout=1800,
+            )
+    if response.status_code != 200:
+        raise RuntimeError(f"Remote backend returned HTTP {response.status_code}: {response.text[:500]}")
+    content_type = response.headers.get("content-type", "")
+    if "application/json" in content_type:
+        payload = response.json()
+        raise RuntimeError(f"Remote backend returned JSON instead of solved ZIP: {payload}")
+    return response.content
+
+
+def extract_remote_solved_zip(zip_bytes, job_id):
+    """Extract remote solved CFD ZIP into the app data folder and return the extraction directory."""
+    root = app_data_dir() / "cases" / f"{job_id}_remote_solved"
+    if root.exists():
+        shutil.rmtree(root, ignore_errors=True)
+    root.mkdir(parents=True, exist_ok=True)
+    zip_path = root / f"{job_id}_remote_solved.zip"
+    zip_path.write_bytes(zip_bytes)
+    with zipfile.ZipFile(BytesIO(zip_bytes), "r") as zf:
+        zf.extractall(root)
+    return root, zip_path
+
+
+def find_remote_visual_json(extract_dir):
+    candidates = list(Path(extract_dir).rglob("cfd_visual_mesh.json"))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
+def _remote_array(values, default=None):
+    try:
+        arr = np.asarray(values, dtype=float)
+        if arr.size == 0:
+            return default
+        return arr
+    except Exception:
+        return default
+
+
+def make_remote_cfd_field_figure(visual_payload, field_key, title, colorbar_title, object_opacity=0.55, max_points=45000):
+    """Create a Plotly 3D figure from backend-generated cfd_visual_mesh.json."""
+    points = _remote_array(visual_payload.get("points"))
+    field = _remote_array(visual_payload.get(field_key))
+    if points is None or points.ndim != 2 or points.shape[1] < 3:
+        return None, "Remote CFD visual JSON does not contain usable 3D points."
+    if field is None or len(field) != len(points):
+        return None, f"Remote CFD visual JSON does not contain usable {field_key} values."
+    n = len(points)
+    if n > max_points:
+        idx = np.linspace(0, n - 1, max_points).astype(int)
+        points_plot = points[idx]
+        field_plot = field[idx]
+    else:
+        points_plot = points
+        field_plot = field
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter3d(
+            x=points_plot[:, 0],
+            y=points_plot[:, 1],
+            z=points_plot[:, 2],
+            mode="markers",
+            marker=dict(
+                size=2,
+                color=field_plot,
+                colorscale="Turbo",
+                colorbar=dict(title=colorbar_title),
+                showscale=True,
+            ),
+            text=[f"{colorbar_title}: {v:.6g}" for v in field_plot],
+            hovertemplate="x=%{x:.6g}<br>y=%{y:.6g}<br>z=%{z:.6g}<br>%{text}<extra></extra>",
+            name=colorbar_title,
+        )
+    )
+    obj = visual_payload.get("object_mesh") or {}
+    vertices = _remote_array(obj.get("vertices"))
+    i = obj.get("i")
+    j = obj.get("j")
+    k = obj.get("k")
+    if vertices is not None and vertices.ndim == 2 and vertices.shape[1] >= 3 and i and j and k:
+        fig.add_trace(
+            go.Mesh3d(
+                x=vertices[:, 0],
+                y=vertices[:, 1],
+                z=vertices[:, 2],
+                i=i,
+                j=j,
+                k=k,
+                color="lightgray",
+                opacity=object_opacity,
+                name="Uploaded object",
+                showscale=False,
+            )
+        )
+    elif vertices is not None and vertices.ndim == 2 and vertices.shape[1] >= 3:
+        fig.add_trace(
+            go.Scatter3d(
+                x=vertices[:, 0],
+                y=vertices[:, 1],
+                z=vertices[:, 2],
+                mode="markers",
+                marker=dict(size=3, color="black"),
+                name="Uploaded object",
+            )
+        )
+    meta = visual_payload.get("metadata", {}) or {}
+    fmin = float(np.nanmin(field))
+    fmax = float(np.nanmax(field))
+    fmean = float(np.nanmean(field))
+    fig.update_layout(
+        title=title,
+        scene=dict(xaxis_title="X [m]", yaxis_title="Y [m]", zaxis_title="Z [m]", aspectmode="data"),
+        margin=dict(l=0, r=0, t=55, b=0),
+        height=760,
+        meta={
+            "field_min": fmin,
+            "field_max": fmax,
+            "field_mean": fmean,
+            "field_delta": fmax - fmin,
+            "source_vtu": meta.get("source_vtu", ""),
+            "object_surface": meta.get("object_surface", ""),
+        },
+        legend=dict(orientation="h"),
+    )
+    return fig, "OK"
+
+
+def render_remote_cfd_visuals_from_zip(zip_bytes, job_id):
+    """Extract and display remote backend pressure, velocity, and gradient visuals."""
+    extract_dir, solved_zip_path = extract_remote_solved_zip(zip_bytes, job_id)
+    visual_json = find_remote_visual_json(extract_dir)
+    if visual_json is None:
+        st.warning("Remote solved ZIP was downloaded, but cfd_visual_mesh.json was not found.")
+        with st.expander("Remote solved ZIP contents"):
+            try:
+                with zipfile.ZipFile(solved_zip_path, "r") as zf:
+                    for name in zf.namelist()[:200]:
+                        st.text(name)
+            except Exception:
+                pass
+        return
+    payload = json.loads(visual_json.read_text(encoding="utf-8", errors="ignore"))
+    meta = payload.get("metadata", {}) or {}
+    st.subheader("Remote OpenFOAM 3D Results")
+    st.caption(f"Remote CFD visual JSON loaded: {visual_json}")
+    if meta.get("source_vtu"):
+        st.caption(f"Docker-generated OpenFOAM VTU source: {meta.get('source_vtu')}")
+    if meta.get("object_surface"):
+        st.caption(f"Docker-generated object surface source: {meta.get('object_surface')}")
+    views = [
+        ("Pressure", "pressure", "Remote OpenFOAM 3D Pressure Field", "Pressure [Pa]"),
+        ("Velocity", "velocity_magnitude", "Remote OpenFOAM 3D Velocity Magnitude Field", "|U| [m/s]"),
+        ("Pressure Gradient", "pressure_gradient_magnitude", "Remote OpenFOAM Pressure Gradient Magnitude", "|∇p| [Pa/m]"),
+        ("Velocity Gradient", "velocity_gradient_magnitude", "Remote OpenFOAM Velocity Gradient Magnitude", "|∇U| [1/s]"),
+    ]
+    for label, field_key, title, colorbar_title in views:
+        st.markdown(f"### {label} View")
+        fig, msg = make_remote_cfd_field_figure(payload, field_key, title, colorbar_title)
+        if fig is None:
+            st.warning(msg)
+            continue
+        st.plotly_chart(fig, use_container_width=True)
+        fmeta = fig.layout.meta or {}
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Min", f"{fmeta.get('field_min', 0):.6g}")
+        c2.metric("Max", f"{fmeta.get('field_max', 0):.6g}")
+        c3.metric("Mean", f"{fmeta.get('field_mean', 0):.6g}")
+        c4.metric("Range", f"{fmeta.get('field_delta', 0):.6g}")
+        try:
+            if label == "Pressure":
+                cache_cfd_report_visual(
+                    "cached_cfd_pressure_visual",
+                    "Remote OpenFOAM Pressure Field View",
+                    plotly_fig_to_png_bytes(fig),
+                    "Remote Docker/OpenFOAM pressure field visualization generated from cfd_visual_mesh.json.",
+                )
+            elif label == "Velocity":
+                cache_cfd_report_visual(
+                    "cached_cfd_velocity_visual",
+                    "Remote OpenFOAM Velocity Field View",
+                    plotly_fig_to_png_bytes(fig),
+                    "Remote Docker/OpenFOAM velocity magnitude field visualization generated from cfd_visual_mesh.json.",
+                )
+        except Exception:
+            pass
+    st.download_button(
+        "Download Remote Solved CFD Case ZIP",
+        data=zip_bytes,
+        file_name=f"{job_id}_remote_solved.zip",
+        mime="application/zip",
+        key=f"download_remote_solved_{job_id}",
+    )
+
+
 with tab4:
     st.subheader("Force Simulation — OpenFOAM CFD")
 
@@ -8098,18 +8251,17 @@ with tab4:
             help="This can take a long time. Leave off for quick case generation."
         )
 
-        backend_available, backend_url, backend_api_key = get_remote_cfd_backend_config()
+        backend_url, backend_api_key, backend_available = get_remote_cfd_backend_config()
         use_remote_backend = False
-
         if backend_available:
             use_remote_backend = st.checkbox(
                 "Run CFD through remote Jewlz backend",
                 value=True,
-                help="Send the generated OpenFOAM case ZIP to the secure Jewlz CFD backend running Docker/OpenFOAM."
+                help="Send the generated OpenFOAM case ZIP to your Docker/OpenFOAM FastAPI backend."
             )
             st.success("Remote Jewlz CFD backend connected through secure API tunnel.")
         else:
-            st.info("Remote CFD backend is not configured. Add CFD_BACKEND_URL and CFD_BACKEND_API_KEY in Streamlit secrets to enable public full-version CFD.")
+            st.info("Remote Jewlz CFD backend is not configured. Add CFD_BACKEND_URL and CFD_BACKEND_API_KEY in Streamlit secrets.")
 
         if st.button("Submit CFD Job"):
             input_data = {
@@ -8134,8 +8286,6 @@ with tab4:
                 "domain_scale_upstream": domain_scale_upstream,
                 "domain_scale_downstream": domain_scale_downstream,
                 "domain_scale_cross": domain_scale_cross,
-                "remote_backend": bool(use_remote_backend),
-                "backend_url_configured": bool(backend_available),
             }
 
             job_id = create_cfd_job(input_data)
@@ -8168,60 +8318,24 @@ with tab4:
             if ok and use_remote_backend and backend_available:
                 st.subheader("Remote CFD Backend Progress")
                 st.info("Sending generated OpenFOAM case ZIP to Jewlz CFD backend on your PC.")
-
-                job_record_for_remote = get_cfd_job(job_id)
-                local_case_zip = job_record_for_remote.get("zip_path") if job_record_for_remote else ""
-
-                remote_ok, remote_msg, remote_zip_path, remote_payload = submit_case_zip_to_remote_backend(
-                    job_id=job_id,
-                    zip_path=local_case_zip,
-                    backend_url=backend_url,
-                    backend_api_key=backend_api_key,
-                    notes=job_notes,
-                )
-
-                if remote_ok:
-                    st.success(remote_msg)
-
-                    update_cfd_job(
-                        job_id,
-                        status="remote_complete",
-                        progress=1.0,
-                        message=remote_msg,
-                        zip_path=remote_zip_path or local_case_zip,
-                        result_data={
-                            "remote_backend": True,
-                            "remote_payload": remote_payload,
-                            "remote_zip_path": remote_zip_path,
-                        },
+                try:
+                    generated_job = get_cfd_job(job_id)
+                    case_zip_path = generated_job.get("zip_path") if generated_job else None
+                    if not case_zip_path or not Path(case_zip_path).exists():
+                        raise RuntimeError("Generated OpenFOAM case ZIP was not found before remote submission.")
+                    solved_zip_bytes = post_case_zip_to_remote_backend(
+                        backend_url=backend_url,
+                        backend_api_key=backend_api_key,
+                        case_zip_path=case_zip_path,
+                        job_id=job_id,
+                        notes=job_notes,
                     )
+                    st.success("Remote OpenFOAM CFD completed. Solved case ZIP downloaded from backend.")
+                    render_remote_cfd_visuals_from_zip(solved_zip_bytes, job_id)
+                except Exception as remote_error:
+                    st.error(f"Remote CFD backend failed: {remote_error}")
 
-                    if remote_zip_path and Path(remote_zip_path).exists():
-                        with open(remote_zip_path, "rb") as solved_zip_file:
-                            st.download_button(
-                                "Download Remote Solved CFD Case ZIP",
-                                data=solved_zip_file.read(),
-                                file_name=Path(remote_zip_path).name,
-                                mime="application/zip",
-                            )
-                    else:
-                        with st.expander("Remote backend response"):
-                            st.json(remote_payload)
-                else:
-                    st.error(f"Remote CFD backend failed: {remote_msg}")
-                    update_cfd_job(
-                        job_id,
-                        status="remote_failed",
-                        progress=1.0,
-                        message=remote_msg,
-                        result_data={
-                            "remote_backend": True,
-                            "remote_error": remote_msg,
-                            "remote_payload": remote_payload,
-                        },
-                    )
-
-            if ok and run_case_after_generation and not use_remote_backend:
+            if ok and (not use_remote_backend) and run_case_after_generation:
                 progress_box = st.container()
                 with progress_box:
                     st.subheader("CFD Progress")
