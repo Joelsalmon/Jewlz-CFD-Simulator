@@ -8,7 +8,6 @@ import os
 import re
 import shutil
 import subprocess
-import requests
 import zipfile
 import sqlite3
 import json
@@ -56,141 +55,6 @@ AUTO_INSTALL_PDF_EXPORTER = True
 DOCKER_OPENFOAM_CONTAINER = "jewlz-openfoam"
 DOCKER_OPENFOAM_IMAGE = "opencfd/openfoam-default:latest"
 DOCKER_OPENFOAM_RUN_ROOT = "/tmp/jewlz_fluidforce_openfoam"
-
-
-# Remote FastAPI backend settings.
-# Streamlit Cloud uses these secrets to reach your PC through Cloudflare Tunnel.
-CFD_BACKEND_URL = st.secrets.get("CFD_BACKEND_URL", os.environ.get("CFD_BACKEND_URL", "")).rstrip("/")
-CFD_BACKEND_API_KEY = st.secrets.get("CFD_BACKEND_API_KEY", os.environ.get("CFD_BACKEND_API_KEY", ""))
-
-
-def remote_backend_configured():
-    return bool(CFD_BACKEND_URL and CFD_BACKEND_API_KEY)
-
-
-def remote_cfd_backend_health(timeout=20):
-    if not remote_backend_configured():
-        return False, {"message": "Remote CFD backend URL/API key not configured."}
-    try:
-        r = requests.get(
-            f"{CFD_BACKEND_URL}/health",
-            headers={"x-api-key": CFD_BACKEND_API_KEY},
-            timeout=timeout,
-        )
-        if r.ok:
-            return True, r.json()
-        return False, {"message": r.text, "status_code": r.status_code}
-    except Exception as e:
-        return False, {"message": str(e)}
-
-
-def submit_case_zip_to_remote_backend(case_zip_path, run_solver=True, notes="", timeout=2400):
-    """
-    Sends the generated OpenFOAM case ZIP to your private Jewlz CFD backend.
-
-    Supports both backend response styles:
-      1. JSON with result_zip_base64 (preferred for Streamlit Cloud)
-      2. Direct application/zip response
-    """
-    if not remote_backend_configured():
-        raise RuntimeError("Remote CFD backend is not configured. Add CFD_BACKEND_URL and CFD_BACKEND_API_KEY to Streamlit secrets.")
-
-    case_zip_path = Path(case_zip_path)
-    if not case_zip_path.exists():
-        raise RuntimeError(f"Case ZIP was not found: {case_zip_path}")
-
-    with case_zip_path.open("rb") as f:
-        files = {"case_zip": (case_zip_path.name, f, "application/zip")}
-        data = {
-            "run_solver": str(bool(run_solver)).lower(),
-            "run_snappy": "true",
-            "notes": notes or "",
-            "job_notes": notes or "",
-        }
-        r = requests.post(
-            f"{CFD_BACKEND_URL}/run_case_zip",
-            headers={"x-api-key": CFD_BACKEND_API_KEY},
-            files=files,
-            data=data,
-            timeout=timeout,
-        )
-
-    if not r.ok:
-        raise RuntimeError(f"Remote CFD backend failed: {r.text}")
-
-    content_type = (r.headers.get("content-type") or "").lower()
-
-    if "application/json" in content_type:
-        backend_status = r.json()
-
-        zip_b64 = backend_status.get("result_zip_base64") or backend_status.get("zip_base64")
-        if zip_b64:
-            solved_zip_bytes = base64.b64decode(zip_b64)
-            return backend_status, solved_zip_bytes
-
-        backend_job_id = backend_status.get("backend_job_id") or backend_status.get("job_id")
-        download_url = backend_status.get("download_url")
-        if download_url:
-            if download_url.startswith("/"):
-                download_url = f"{CFD_BACKEND_URL}{download_url}"
-        elif backend_job_id:
-            download_url = f"{CFD_BACKEND_URL}/download/{backend_job_id}"
-
-        if not download_url:
-            raise RuntimeError("Remote CFD backend completed but did not return result ZIP data or a download URL.")
-
-        download = requests.get(
-            download_url,
-            headers={"x-api-key": CFD_BACKEND_API_KEY},
-            timeout=600,
-        )
-        if not download.ok:
-            raise RuntimeError(f"Could not download solved CFD ZIP: {download.text}")
-
-        return backend_status, download.content
-
-    backend_status = {
-        "status": "completed",
-        "message": "CFD job completed successfully.",
-        "vtk_available": True,
-    }
-    return backend_status, r.content
-
-
-def extract_remote_solved_case_zip(solved_zip_path, local_job_id):
-    """
-    Extracts the remote solved case ZIP so the Streamlit visualizer and PDF exporter
-    can discover actual OpenFOAM VTK files.
-
-    Returns the case_dir that should be stored in the CFD job database.
-    The selected case_dir is the folder that directly contains VTK/.
-    """
-    solved_zip_path = Path(solved_zip_path)
-    extract_root = app_data_dir() / "cases" / f"{local_job_id}_remote_solved"
-
-    if extract_root.exists():
-        shutil.rmtree(extract_root)
-    extract_root.mkdir(parents=True, exist_ok=True)
-
-    with zipfile.ZipFile(solved_zip_path, "r") as z:
-        for member in z.infolist():
-            name = member.filename.replace("\\", "/")
-            if name.startswith("/") or ".." in Path(name).parts:
-                continue
-            z.extract(member, extract_root)
-
-    candidates = []
-    for vtk_dir in extract_root.rglob("VTK"):
-        if vtk_dir.is_dir() and list(vtk_dir.rglob("*")):
-            candidates.append(vtk_dir.parent)
-
-    if candidates:
-        for c in candidates:
-            if c.name == "docker_results":
-                return c
-        return candidates[0]
-
-    return extract_root
 
 
 # Embedded Jewlz Technologies logo for PDF reports.
@@ -7586,7 +7450,7 @@ def make_fluidforce_pdf_report(
 # Streamlit UI
 # -----------------------------
 st.title("Jewlz FluidForce Simulator")
-st.caption("Version V3.88 — Remote CFD VTK visualization and PDF export support added. Supported uploads: STL, OBJ, PLY.")
+st.caption("Version V3.86 — Docker OpenFOAM local worker support added. Supported uploads: STL, OBJ, PLY.")
 init_job_db()
 
 with st.sidebar:
@@ -8109,20 +7973,9 @@ with tab4:
     availability = openfoam_available()
     render_openfoam_system_health(availability)
 
-    remote_backend_ok = False
-    remote_backend_info = {}
-    if remote_backend_configured():
-        remote_backend_ok, remote_backend_info = remote_cfd_backend_health(timeout=20)
-        if remote_backend_ok:
-            st.success("Remote Jewlz CFD backend connected through secure API tunnel.")
-        else:
-            st.warning(f"Remote Jewlz CFD backend is configured but not reachable: {remote_backend_info.get('message', remote_backend_info)}")
-    else:
-        st.info("Remote CFD backend is not configured. Add CFD_BACKEND_URL and CFD_BACKEND_API_KEY in Streamlit secrets for public full-version CFD.")
-
     if availability.get("mode") == "docker":
         st.success(f"Using local Docker/OpenFOAM worker: {availability.get('container', DOCKER_OPENFOAM_CONTAINER)}")
-    elif availability.get("mode") == "unavailable" and not remote_backend_ok:
+    elif availability.get("mode") == "unavailable":
         st.info(
             f"For local no-cost CFD, start the Docker worker in PowerShell: "
             f"docker start -ai {DOCKER_OPENFOAM_CONTAINER}"
@@ -8132,7 +7985,7 @@ with tab4:
         with st.expander("OpenFOAM runtime note", expanded=False):
             st.info(
                 "In the future cloud version, these OpenFOAM commands will run on your CFD server. "
-                "The customer will only see Submit Job → Status → Results. On this build, OpenFOAM can run locally through Docker or remotely through your private FastAPI backend."
+                "The customer will only see Submit Job → Status → Results. On this Windows prototype, OpenFOAM runs through WSL."
             )
 
     if geom is None:
@@ -8158,13 +8011,6 @@ with tab4:
             "Also run simpleFoam solver",
             value=False,
             help="This can take a long time. Leave off for quick case generation."
-        )
-
-        use_remote_backend = st.checkbox(
-            "Run CFD through remote Jewlz backend",
-            value=bool(remote_backend_ok and availability.get("mode") == "unavailable"),
-            help="For Streamlit Cloud/customer use. Sends the generated OpenFOAM case ZIP to your PC FastAPI backend through Cloudflare Tunnel.",
-            disabled=not bool(remote_backend_configured()),
         )
 
         if st.button("Submit CFD Job"):
@@ -8219,94 +8065,7 @@ with tab4:
             else:
                 st.error(f"CFD job failed: {msg}")
 
-            if ok and use_remote_backend:
-                try:
-                    remote_progress = st.container()
-                    with remote_progress:
-                        st.subheader("Remote CFD Backend Progress")
-                        st.info("Sending generated OpenFOAM case ZIP to Jewlz CFD backend on your PC.")
-
-                    job_now = get_cfd_job(job_id)
-                    case_zip_path = job_now.get("zip_path") if job_now else None
-                    backend_status, solved_zip_bytes = submit_case_zip_to_remote_backend(
-                        case_zip_path,
-                        run_solver=run_solver_after_meshing,
-                        notes=job_notes,
-                    )
-
-                    solved_zip_path = app_data_dir() / "jobs" / f"{job_id}_remote_solved_case.zip"
-                    solved_zip_path.write_bytes(solved_zip_bytes)
-
-                    remote_case_dir = extract_remote_solved_case_zip(solved_zip_path, job_id)
-                    remote_vtk = find_latest_openfoam_vtk(remote_case_dir)
-
-                    result_data = (job_now or {}).get("result", {}) if job_now else {}
-                    result_data["remote_backend"] = backend_status
-                    result_data["remote_backend_url"] = CFD_BACKEND_URL
-                    result_data["remote_solved_zip"] = str(solved_zip_path)
-                    result_data["remote_case_dir"] = str(remote_case_dir)
-                    result_data["remote_vtk_path"] = str(remote_vtk) if remote_vtk else ""
-
-                    update_cfd_job(
-                        job_id,
-                        status="complete",
-                        progress=1.0,
-                        message="Remote Jewlz CFD backend completed OpenFOAM run.",
-                        case_dir=str(remote_case_dir),
-                        zip_path=str(solved_zip_path),
-                        result_data=result_data,
-                    )
-                    st.success("Remote OpenFOAM CFD completed. CFD VTK results were extracted for software and PDF visualization.")
-
-                    if remote_vtk is not None:
-                        st.caption(f"Remote CFD visual file loaded: {remote_vtk}")
-
-                        pressure_fig, pressure_msg = openfoam_vtk_figure(
-                            remote_case_dir,
-                            bounds_m=bounds_m,
-                            front_selection=front_selection,
-                            field_mode="pressure",
-                            rho_ref=rho,
-                            velocity_ref=velocity,
-                            static_pressure_ref=pressure_pa,
-                            show_fluid_field=False,
-                            show_footer_note=False,
-                            zoom_to_object=True,
-                        )
-                        if pressure_fig is not None:
-                            st.plotly_chart(pressure_fig, use_container_width=True)
-                        else:
-                            st.warning(f"Pressure visual could not be generated yet: {pressure_msg}")
-
-                        velocity_fig, velocity_msg = openfoam_vtk_figure(
-                            remote_case_dir,
-                            bounds_m=bounds_m,
-                            front_selection=front_selection,
-                            field_mode="velocity",
-                            rho_ref=rho,
-                            velocity_ref=velocity,
-                            static_pressure_ref=pressure_pa,
-                            show_fluid_field=True,
-                            zoom_to_object=True,
-                        )
-                        if velocity_fig is not None:
-                            st.plotly_chart(velocity_fig, use_container_width=True)
-                        else:
-                            st.warning(f"Velocity visual could not be generated yet: {velocity_msg}")
-                    else:
-                        st.warning("Remote OpenFOAM completed, but no VTK/internal.vtu file was found after extracting the solved ZIP.")
-
-                    st.download_button(
-                        "Download Remote Solved CFD Case ZIP",
-                        data=solved_zip_bytes,
-                        file_name=solved_zip_path.name,
-                        mime="application/zip",
-                    )
-                except Exception as e:
-                    update_cfd_job(job_id, status="failed", progress=1.0, message=f"Remote CFD backend failed: {e}")
-                    st.error(f"Remote CFD backend failed: {e}")
-
-            if ok and run_case_after_generation and not use_remote_backend:
+            if ok and run_case_after_generation:
                 progress_box = st.container()
                 with progress_box:
                     st.subheader("CFD Progress")
