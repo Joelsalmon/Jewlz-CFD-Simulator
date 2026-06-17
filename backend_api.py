@@ -141,6 +141,105 @@ def find_latest_internal_vtu(results_dir: Path) -> Optional[Path]:
     return sorted(candidates, key=timestep_score, reverse=True)[0]
 
 
+
+def find_latest_object_surface(results_dir: Path) -> Optional[Path]:
+    """Locate the object/boundary surface exported by foamToVTK."""
+    root = Path(results_dir)
+
+    # Prefer the object patch created by the generated OpenFOAM case.
+    preferred_names = [
+        "object.vtp",
+        "object.stl",
+        "geometry.vtp",
+        "uploaded_object.vtp",
+        "surface.vtp",
+    ]
+
+    candidates = []
+    for name in preferred_names:
+        candidates.extend(root.rglob(name))
+
+    # Fallback: use any VTP boundary file that is not an inlet/outlet/wall patch if possible.
+    if not candidates:
+        all_vtp = list(root.rglob("*.vtp"))
+        skip_words = ("inlet", "outlet", "front", "back", "upper", "lower", "wall", "empty")
+        candidates = [p for p in all_vtp if not any(w in p.name.lower() for w in skip_words)]
+        if not candidates:
+            candidates = all_vtp
+
+    if not candidates:
+        return None
+
+    # Prefer newest file and, secondarily, larger files because object surfaces are usually larger.
+    candidates.sort(key=lambda x: (x.stat().st_mtime, x.stat().st_size), reverse=True)
+    return candidates[0]
+
+
+def extract_object_mesh_for_json(surface_path: Optional[Path], pv, np, max_faces: int = 25000):
+    """
+    Convert object/boundary surface to Plotly Mesh3d JSON.
+
+    Returns a dict with vertices plus i/j/k triangle indices, or an error dict.
+    """
+    if surface_path is None:
+        return {"error": "No object surface VTP/STL found in foamToVTK results."}
+
+    try:
+        surf = pv.read(str(surface_path))
+
+        # Ensure we have a polygonal triangular surface for Plotly Mesh3d.
+        try:
+            surf = surf.extract_surface()
+        except Exception:
+            pass
+        try:
+            surf = surf.triangulate()
+        except Exception:
+            pass
+
+        vertices = np.asarray(surf.points, dtype=float)
+        if vertices.ndim != 2 or vertices.shape[1] < 3 or len(vertices) == 0:
+            return {"error": f"Object surface has no usable points: {surface_path}"}
+        vertices = vertices[:, :3]
+
+        faces_raw = np.asarray(getattr(surf, "faces", []), dtype=int)
+        if faces_raw.size == 0:
+            return {"error": f"Object surface has no polygon faces: {surface_path}"}
+
+        tri_faces = []
+        pos = 0
+        while pos < len(faces_raw):
+            n = int(faces_raw[pos])
+            ids = faces_raw[pos + 1: pos + 1 + n]
+            if n == 3:
+                tri_faces.append(ids.tolist())
+            elif n > 3:
+                # Fan triangulation fallback for non-tri polygons.
+                for k in range(1, n - 1):
+                    tri_faces.append([int(ids[0]), int(ids[k]), int(ids[k + 1])])
+            pos += n + 1
+
+        if not tri_faces:
+            return {"error": f"Object surface produced no triangles: {surface_path}"}
+
+        # Limit face count for browser performance.
+        if len(tri_faces) > max_faces:
+            step = max(1, len(tri_faces) // max_faces)
+            tri_faces = tri_faces[::step][:max_faces]
+
+        tri = np.asarray(tri_faces, dtype=int)
+        return {
+            "vertices": vertices.tolist(),
+            "i": tri[:, 0].astype(int).tolist(),
+            "j": tri[:, 1].astype(int).tolist(),
+            "k": tri[:, 2].astype(int).tolist(),
+            "source": str(surface_path),
+            "n_vertices": int(len(vertices)),
+            "n_faces": int(len(tri)),
+        }
+    except Exception as e:
+        return {"error": f"Object mesh extraction failed from {surface_path}: {e}"}
+
 def _sample_indices(n: int, max_points: int = 60000):
     if n <= max_points:
         return list(range(n))
