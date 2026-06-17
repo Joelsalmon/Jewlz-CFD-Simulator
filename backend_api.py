@@ -257,11 +257,15 @@ def generate_cfd_visual_assets(results_dir: Path, logs: dict, max_points: int = 
         pressure = np.asarray(pressure[idx], dtype=float)
         velocity_mag = np.asarray(velocity_mag[idx], dtype=float)
 
+        object_surface_path = find_latest_object_surface(results_dir)
+        object_mesh = extract_object_mesh_for_json(object_surface_path, pv, np, max_faces=25000)
+
         json_path = Path(results_dir) / "cfd_visual_mesh.json"
         payload = {
             "points": cloud_points.tolist(),
             "pressure": pressure.tolist(),
             "velocity_magnitude": velocity_mag.tolist(),
+            "object_mesh": object_mesh,
             "metadata": {
                 "source_vtu": str(vtu_path),
                 "source_kind": source_kind,
@@ -273,6 +277,8 @@ def generate_cfd_visual_assets(results_dir: Path, logs: dict, max_points: int = 
                 "pressure_max": float(np.nanmax(pressure)) if len(pressure) else 0.0,
                 "velocity_min": float(np.nanmin(velocity_mag)) if len(velocity_mag) else 0.0,
                 "velocity_max": float(np.nanmax(velocity_mag)) if len(velocity_mag) else 0.0,
+                "object_surface": str(object_surface_path) if object_surface_path else "",
+                "object_mesh_available": bool(object_mesh and not object_mesh.get("error")),
             },
         }
         json_path.write_text(json.dumps(payload), encoding="utf-8")
@@ -307,7 +313,13 @@ def generate_cfd_visual_assets(results_dir: Path, logs: dict, max_points: int = 
         except Exception as e:
             assets["png_warning"] = str(e)
 
-        assets.update({"created": True, "json": str(json_path), "message": "Backend CFD visual assets created with PyVista."})
+        assets.update({
+            "created": True,
+            "json": str(json_path),
+            "object_surface": str(object_surface_path) if object_surface_path else "",
+            "object_mesh_available": bool(object_mesh and not object_mesh.get("error")),
+            "message": "Backend CFD visual assets created with PyVista and object overlay."
+        })
         return assets
     except Exception as e:
         assets["message"] = f"Backend CFD visual asset generation failed with PyVista: {e}"

@@ -235,6 +235,7 @@ def load_backend_visual_mesh(case_dir):
             "points": points,
             "pressure": pressure if len(pressure) == len(points) else None,
             "velocity_magnitude": velocity if len(velocity) == len(points) else None,
+            "object_mesh": payload.get("object_mesh"),
             "metadata": payload.get("metadata", {}),
         }, None
     except Exception as e:
@@ -276,6 +277,28 @@ def backend_visual_mesh_figure(case_dir, field_mode="pressure", max_points=60000
         colorbar_title = "Field unavailable"
 
     fig = go.Figure()
+
+    object_mesh = data.get("object_mesh")
+    if isinstance(object_mesh, dict) and not object_mesh.get("error"):
+        try:
+            verts = np.asarray(object_mesh.get("vertices", []), dtype=float)
+            ii = object_mesh.get("i", [])
+            jj = object_mesh.get("j", [])
+            kk = object_mesh.get("k", [])
+            if verts.ndim == 2 and verts.shape[1] == 3 and len(verts) > 0 and len(ii) > 0:
+                fig.add_trace(go.Mesh3d(
+                    x=verts[:, 0], y=verts[:, 1], z=verts[:, 2],
+                    i=ii, j=jj, k=kk,
+                    name="Uploaded Object Surface",
+                    color="lightgray",
+                    opacity=0.92,
+                    flatshading=True,
+                    hovertemplate="Uploaded object surface<extra></extra>",
+                    showscale=False,
+                ))
+        except Exception:
+            pass
+
     fig.add_trace(go.Scatter3d(
         x=pts[:, 0], y=pts[:, 1], z=pts[:, 2],
         mode="markers",
