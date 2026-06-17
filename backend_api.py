@@ -120,6 +120,173 @@ def make_results_zip(job_dir: Path, job_id: str):
 
     return zip_out
 
+
+
+def find_latest_internal_vtu(results_dir: Path) -> Optional[Path]:
+    """Find the latest OpenFOAM foamToVTK internal.vtu file."""
+    candidates = list(Path(results_dir).rglob("internal.vtu"))
+    if not candidates:
+        return None
+
+    def timestep_score(path: Path):
+        # Prefer the largest numeric timestep folder name, then newest mtime.
+        score = -1.0
+        for part in path.parts:
+            try:
+                score = max(score, float(part.split("_")[-1]))
+            except Exception:
+                pass
+        return (score, path.stat().st_mtime)
+
+    return sorted(candidates, key=timestep_score, reverse=True)[0]
+
+
+def _sample_indices(n: int, max_points: int = 60000):
+    if n <= max_points:
+        return list(range(n))
+    step = max(1, n // max_points)
+    return list(range(0, n, step))[:max_points]
+
+
+def generate_cfd_visual_assets(results_dir: Path, logs: dict, max_points: int = 60000):
+    """
+    Backend-side VTU parsing.
+
+    Creates:
+      - cfd_visual_mesh.json for Streamlit interactive 3D Plotly
+      - pressure_visual.png for PDF report
+      - velocity_visual.png for PDF report
+
+    Streamlit should display the JSON-based 3D visualization and use PNGs only
+    when exporting/embedding the PDF report.
+    """
+    assets = {"created": False, "message": ""}
+    vtu_path = find_latest_internal_vtu(results_dir)
+    if vtu_path is None:
+        assets["message"] = "No internal.vtu found under copied VTK results."
+        return assets
+
+    try:
+        import numpy as np
+        import meshio
+    except Exception as e:
+        assets["message"] = f"meshio/numpy unavailable on backend: {e}"
+        return assets
+
+    try:
+        mesh = meshio.read(str(vtu_path))
+        points = np.asarray(mesh.points, dtype=float)
+        if points.ndim != 2 or points.shape[1] < 3 or len(points) == 0:
+            assets["message"] = "VTU contains no usable points."
+            return assets
+        points = points[:, :3]
+
+        point_pressure = None
+        point_velocity = None
+        if "p" in mesh.point_data:
+            point_pressure = np.asarray(mesh.point_data["p"], dtype=float).reshape(-1)
+        if "U" in mesh.point_data:
+            point_velocity = np.asarray(mesh.point_data["U"], dtype=float)
+
+        centers = None
+        cell_pressure = None
+        cell_velocity = None
+
+        # Many OpenFOAM foamToVTK files store fields as cell_data.
+        for block_i, block in enumerate(mesh.cells):
+            cell_conn = np.asarray(block.data, dtype=int)
+            if cell_conn.size == 0:
+                continue
+            # Use first substantial cell block.
+            centers = points[cell_conn].mean(axis=1)
+            try:
+                if "p" in mesh.cell_data:
+                    cell_pressure = np.asarray(mesh.cell_data["p"][block_i], dtype=float).reshape(-1)
+                if "U" in mesh.cell_data:
+                    cell_velocity = np.asarray(mesh.cell_data["U"][block_i], dtype=float)
+            except Exception:
+                pass
+            if centers is not None and len(centers) > 0:
+                break
+
+        if point_pressure is not None or point_velocity is not None:
+            cloud_points = points
+            pressure = point_pressure if point_pressure is not None and len(point_pressure) == len(points) else np.zeros(len(points))
+            if point_velocity is not None and len(point_velocity) == len(points):
+                velocity_mag = np.linalg.norm(point_velocity[:, :3], axis=1) if point_velocity.ndim == 2 else np.abs(point_velocity)
+            else:
+                velocity_mag = np.zeros(len(points))
+            source_kind = "point_data"
+        elif centers is not None and len(centers) > 0:
+            cloud_points = centers
+            pressure = cell_pressure if cell_pressure is not None and len(cell_pressure) == len(centers) else np.zeros(len(centers))
+            if cell_velocity is not None and len(cell_velocity) == len(centers):
+                velocity_mag = np.linalg.norm(cell_velocity[:, :3], axis=1) if cell_velocity.ndim == 2 else np.abs(cell_velocity)
+            else:
+                velocity_mag = np.zeros(len(centers))
+            source_kind = "cell_data_centers"
+        else:
+            assets["message"] = "No usable point_data or cell_data fields found in VTU."
+            return assets
+
+        idx = _sample_indices(len(cloud_points), max_points=max_points)
+        cloud_points = np.asarray(cloud_points[idx], dtype=float)
+        pressure = np.asarray(pressure[idx], dtype=float)
+        velocity_mag = np.asarray(velocity_mag[idx], dtype=float)
+
+        json_path = Path(results_dir) / "cfd_visual_mesh.json"
+        payload = {
+            "points": cloud_points.tolist(),
+            "pressure": pressure.tolist(),
+            "velocity_magnitude": velocity_mag.tolist(),
+            "metadata": {
+                "source_vtu": str(vtu_path),
+                "source_kind": source_kind,
+                "n_points": int(len(cloud_points)),
+                "pressure_min": float(np.nanmin(pressure)) if len(pressure) else 0.0,
+                "pressure_max": float(np.nanmax(pressure)) if len(pressure) else 0.0,
+                "velocity_min": float(np.nanmin(velocity_mag)) if len(velocity_mag) else 0.0,
+                "velocity_max": float(np.nanmax(velocity_mag)) if len(velocity_mag) else 0.0,
+            },
+        }
+        json_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        # PDF-only PNGs. Do not rely on these for Streamlit 3D display.
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            def save_png(vals, title, label, out_name):
+                fig = plt.figure(figsize=(9, 6), dpi=150)
+                ax = fig.add_subplot(111, projection="3d")
+                sc = ax.scatter(
+                    cloud_points[:, 0], cloud_points[:, 1], cloud_points[:, 2],
+                    c=vals, s=2, alpha=0.75
+                )
+                ax.set_title(title)
+                ax.set_xlabel("X [m]")
+                ax.set_ylabel("Y [m]")
+                ax.set_zlabel("Z [m]")
+                cb = fig.colorbar(sc, ax=ax, shrink=0.65, pad=0.08)
+                cb.set_label(label)
+                fig.tight_layout()
+                out_path = Path(results_dir) / out_name
+                fig.savefig(out_path, bbox_inches="tight")
+                plt.close(fig)
+                return str(out_path)
+
+            assets["pressure_png"] = save_png(pressure, "Remote OpenFOAM Pressure Field", "Pressure", "pressure_visual.png")
+            assets["velocity_png"] = save_png(velocity_mag, "Remote OpenFOAM Velocity Magnitude", "|U| [m/s]", "velocity_visual.png")
+        except Exception as e:
+            assets["png_warning"] = str(e)
+
+        assets.update({"created": True, "json": str(json_path), "message": "Backend CFD visual assets created."})
+        return assets
+    except Exception as e:
+        assets["message"] = f"Backend CFD visual asset generation failed: {e}"
+        return assets
+
 @app.get("/health")
 def health(x_api_key: Optional[str] = Header(default=None)):
     require_api_key(x_api_key)
@@ -367,6 +534,10 @@ async def run_case_zip(
                 timeout=120,
             )
 
+        status.update(progress=94, message="Generating backend 3D visual assets.")
+        write_status(job_dir, status)
+        logs["visual_assets"] = generate_cfd_visual_assets(results_dir, logs)
+
         (job_dir / "openfoam_logs.json").write_text(
             json.dumps(logs, indent=2),
             encoding="utf-8",
@@ -381,21 +552,10 @@ async def run_case_zip(
 
         write_status(job_dir, status)
 
-        zip_path = make_results_zip(job_dir, job_id)
-        zip_b64 = base64.b64encode(zip_path.read_bytes()).decode("ascii")
-
-        return JSONResponse(
-            status_code=200,
-            content={
-                "job_id": job_id,
-                "status": "completed",
-                "progress": 100,
-                "message": "CFD job completed successfully.",
-                "vtk_available": True,
-                "result_zip_filename": f"{job_id}_results.zip",
-                "result_zip_base64": zip_b64,
-                "download_url": f"/download/{job_id}",
-            },
+        return FileResponse(
+            make_results_zip(job_dir, job_id),
+            media_type="application/zip",
+            filename=f"{job_id}_results.zip",
         )
 
     except Exception as exc:
@@ -414,23 +574,6 @@ async def run_case_zip(
         write_status(job_dir, status)
 
         return JSONResponse(status_code=500, content=status)
-
-
-@app.get("/download/{job_id}")
-def download_results(job_id: str, x_api_key: Optional[str] = Header(default=None)):
-    require_api_key(x_api_key)
-
-    job_dir = JOBS_DIR / job_id
-    zip_path = job_dir / f"{job_id}_results.zip"
-
-    if not zip_path.exists():
-        raise HTTPException(status_code=404, detail="Result ZIP not found.")
-
-    return FileResponse(
-        zip_path,
-        media_type="application/zip",
-        filename=zip_path.name,
-    )
 
 
 @app.get("/status/{job_id}")
