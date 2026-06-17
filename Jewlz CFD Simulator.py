@@ -13,6 +13,7 @@ import sqlite3
 import json
 import base64
 import uuid
+import requests
 from datetime import datetime
 from pathlib import Path
 from io import BytesIO
@@ -3333,6 +3334,90 @@ def zip_directory(source_dir, zip_path):
                 zf.write(file, file.relative_to(source_dir.parent))
 
     return zip_path
+
+
+
+
+def get_remote_cfd_backend_config():
+    """
+    Reads Streamlit secrets for the remote Jewlz CFD backend.
+    Returns (backend_available, backend_url, backend_api_key).
+    """
+    backend_url = ""
+    backend_api_key = ""
+    try:
+        backend_url = str(st.secrets.get("CFD_BACKEND_URL", "") or "").strip().rstrip("/")
+        backend_api_key = str(st.secrets.get("CFD_BACKEND_API_KEY", "") or "").strip()
+    except Exception:
+        backend_url = ""
+        backend_api_key = ""
+    return bool(backend_url and backend_api_key), backend_url, backend_api_key
+
+
+def submit_case_zip_to_remote_backend(job_id, zip_path, backend_url, backend_api_key, notes=""):
+    """
+    Sends the generated OpenFOAM case ZIP to the remote FastAPI backend.
+
+    The backend endpoint used by the current Docker/OpenFOAM worker is:
+        POST /run_case_zip
+    """
+    zip_path = Path(zip_path)
+    if not zip_path.exists():
+        return False, f"Case ZIP not found: {zip_path}", None, {}
+
+    headers = {"x-api-key": backend_api_key}
+
+    try:
+        with open(zip_path, "rb") as f:
+            files = {"case_zip": (zip_path.name, f, "application/zip")}
+            data = {"job_id": job_id, "notes": notes or ""}
+
+            response = requests.post(
+                f"{backend_url}/run_case_zip",
+                headers=headers,
+                files=files,
+                data=data,
+                timeout=1800,
+            )
+    except Exception as e:
+        return False, f"Remote backend request failed: {e}", None, {}
+
+    if response.status_code != 200:
+        body_preview = response.text[:1000] if getattr(response, "text", None) else ""
+        return False, f"Remote backend returned HTTP {response.status_code}: {body_preview}", None, {}
+
+    result_dir = app_data_dir() / "remote_results"
+    result_dir.mkdir(parents=True, exist_ok=True)
+    solved_zip_path = result_dir / f"{job_id}_remote_solved.zip"
+
+    content_type = response.headers.get("content-type", "").lower()
+
+    if "application/zip" in content_type or response.content[:2] == b"PK":
+        solved_zip_path.write_bytes(response.content)
+        return True, "Remote OpenFOAM CFD completed. Solved case ZIP downloaded from backend.", str(solved_zip_path), {
+            "response_type": "zip",
+            "content_type": content_type,
+        }
+
+    try:
+        payload = response.json()
+    except Exception:
+        return False, f"Remote backend returned non-ZIP, non-JSON response: {response.text[:1000]}", None, {
+            "content_type": content_type,
+        }
+
+    for key in ("zip_base64", "solved_zip_base64", "case_zip_base64", "download_zip_base64"):
+        if payload.get(key):
+            try:
+                solved_zip_path.write_bytes(base64.b64decode(payload[key]))
+                return True, "Remote OpenFOAM CFD completed. Solved case ZIP decoded from backend JSON.", str(solved_zip_path), payload
+            except Exception as e:
+                return False, f"Remote backend returned {key}, but it could not be decoded: {e}", None, payload
+
+    if payload.get("status") in ("complete", "completed", "success", "ok") or payload.get("ok") is True:
+        return True, "Remote OpenFOAM CFD completed. Backend returned JSON status.", None, payload
+
+    return False, f"Remote backend returned JSON but did not include a solved ZIP. Payload: {json.dumps(payload)[:1200]}", None, payload
 
 
 def run_openfoam_case(case_dir, run_solver=False):
@@ -8013,6 +8098,19 @@ with tab4:
             help="This can take a long time. Leave off for quick case generation."
         )
 
+        backend_available, backend_url, backend_api_key = get_remote_cfd_backend_config()
+        use_remote_backend = False
+
+        if backend_available:
+            use_remote_backend = st.checkbox(
+                "Run CFD through remote Jewlz backend",
+                value=True,
+                help="Send the generated OpenFOAM case ZIP to the secure Jewlz CFD backend running Docker/OpenFOAM."
+            )
+            st.success("Remote Jewlz CFD backend connected through secure API tunnel.")
+        else:
+            st.info("Remote CFD backend is not configured. Add CFD_BACKEND_URL and CFD_BACKEND_API_KEY in Streamlit secrets to enable public full-version CFD.")
+
         if st.button("Submit CFD Job"):
             input_data = {
                 "notes": job_notes,
@@ -8036,6 +8134,8 @@ with tab4:
                 "domain_scale_upstream": domain_scale_upstream,
                 "domain_scale_downstream": domain_scale_downstream,
                 "domain_scale_cross": domain_scale_cross,
+                "remote_backend": bool(use_remote_backend),
+                "backend_url_configured": bool(backend_available),
             }
 
             job_id = create_cfd_job(input_data)
@@ -8065,7 +8165,63 @@ with tab4:
             else:
                 st.error(f"CFD job failed: {msg}")
 
-            if ok and run_case_after_generation:
+            if ok and use_remote_backend and backend_available:
+                st.subheader("Remote CFD Backend Progress")
+                st.info("Sending generated OpenFOAM case ZIP to Jewlz CFD backend on your PC.")
+
+                job_record_for_remote = get_cfd_job(job_id)
+                local_case_zip = job_record_for_remote.get("zip_path") if job_record_for_remote else ""
+
+                remote_ok, remote_msg, remote_zip_path, remote_payload = submit_case_zip_to_remote_backend(
+                    job_id=job_id,
+                    zip_path=local_case_zip,
+                    backend_url=backend_url,
+                    backend_api_key=backend_api_key,
+                    notes=job_notes,
+                )
+
+                if remote_ok:
+                    st.success(remote_msg)
+
+                    update_cfd_job(
+                        job_id,
+                        status="remote_complete",
+                        progress=1.0,
+                        message=remote_msg,
+                        zip_path=remote_zip_path or local_case_zip,
+                        result_data={
+                            "remote_backend": True,
+                            "remote_payload": remote_payload,
+                            "remote_zip_path": remote_zip_path,
+                        },
+                    )
+
+                    if remote_zip_path and Path(remote_zip_path).exists():
+                        with open(remote_zip_path, "rb") as solved_zip_file:
+                            st.download_button(
+                                "Download Remote Solved CFD Case ZIP",
+                                data=solved_zip_file.read(),
+                                file_name=Path(remote_zip_path).name,
+                                mime="application/zip",
+                            )
+                    else:
+                        with st.expander("Remote backend response"):
+                            st.json(remote_payload)
+                else:
+                    st.error(f"Remote CFD backend failed: {remote_msg}")
+                    update_cfd_job(
+                        job_id,
+                        status="remote_failed",
+                        progress=1.0,
+                        message=remote_msg,
+                        result_data={
+                            "remote_backend": True,
+                            "remote_error": remote_msg,
+                            "remote_payload": remote_payload,
+                        },
+                    )
+
+            if ok and run_case_after_generation and not use_remote_backend:
                 progress_box = st.container()
                 with progress_box:
                     st.subheader("CFD Progress")
