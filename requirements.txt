@@ -10,3 +10,5 @@ scipy
 coolprop
 meshio
 matplotlib
+pyvista
+vtk
