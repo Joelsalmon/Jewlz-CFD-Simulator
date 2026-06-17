@@ -4046,15 +4046,15 @@ def find_latest_object_boundary_vtp(case_dir):
     return candidates[0]
 
 
-
 def read_openfoam_field_points(vtk_path, preferred_fields=None, max_points=120000):
     """
     Reads OpenFOAM foamToVTK output as true cell-centered field points.
 
-    Supports:
-      - binary/appended .vtu and .vtp using meshio
-      - ASCII/XML .vtu and .vtp using the older ElementTree parser fallback
-      - .vtm by selecting internal.vtu
+    IMPORTANT FIX:
+    OpenFOAM's foamToVTK often writes binary .vtu files. The older parser only
+    worked for ASCII XML DataArray text and returned None for binary VTU files.
+    This version uses meshio first for .vtu/.vtp/.vtk files, then falls back to
+    the older XML/text parser only if meshio is unavailable or cannot read the file.
 
     Returns:
       {
@@ -4062,7 +4062,6 @@ def read_openfoam_field_points(vtk_path, preferred_fields=None, max_points=12000
       }
     """
     vtk_path = Path(vtk_path)
-    preferred_order = preferred_fields or ["p", "pressure", "U", "velocity"]
 
     # Handle multiblock VTM by selecting internal.vtu first.
     if vtk_path.suffix.lower() == ".vtm":
@@ -4071,209 +4070,165 @@ def read_openfoam_field_points(vtk_path, preferred_fields=None, max_points=12000
             list(folder.glob("internal.vtu"))
             + list(folder.glob("*.vtu"))
             + list(folder.glob("**/internal.vtu"))
+            + list(folder.glob("**/*.vtu"))
+            + list(folder.glob("**/*.vtp"))
+            + list(folder.glob("**/*.vtk"))
         )
         if not candidates:
             return None
-        return read_openfoam_field_points(
-            candidates[0],
-            preferred_fields=preferred_fields,
-            max_points=max_points,
-        )
+        return read_openfoam_field_points(candidates[0], preferred_fields=preferred_fields, max_points=max_points)
 
-    # ---------------------------------------------------------------------
-    # Primary reader: meshio handles OpenFOAM foamToVTK binary/appended VTU.
-    # The previous parser only handled ASCII XML DataArray text, so binary
-    # internal.vtu files returned "Could not parse OpenFOAM field points".
-    # ---------------------------------------------------------------------
-    if vtk_path.suffix.lower() in [".vtu", ".vtp"]:
+    preferred_order = preferred_fields or ["p", "pressure", "U", "velocity", "mag(U)"]
+
+    # FIRST CHOICE: meshio reader for binary OpenFOAM VTU/VTP/VTK output.
+    if vtk_path.suffix.lower() in [".vtu", ".vtp", ".vtk"]:
         try:
             import meshio
 
             mesh = meshio.read(str(vtk_path))
             points = np.asarray(mesh.points, dtype=float)
 
-            if points.size >= 9 and points.ndim == 2 and points.shape[1] >= 3:
+            if points.ndim != 2 or points.shape[0] == 0 or points.shape[1] < 3:
+                raise RuntimeError("meshio read succeeded, but no XYZ points were found.")
+
+            if points.shape[1] > 3:
                 points = points[:, :3]
 
-                block_centers = []
-                block_node_ids = []
-                block_sizes = []
+            centers_list = []
+            cell_block_sizes = []
+            cell_block_vertex_ids = []
 
-                for cell_block in mesh.cells:
-                    conn = np.asarray(cell_block.data, dtype=int)
-                    if conn.size == 0:
+            for block in mesh.cells:
+                cells = np.asarray(block.data, dtype=int)
+                if cells.size == 0:
+                    continue
+
+                if cells.ndim == 1:
+                    cells = cells.reshape((-1, 1))
+
+                valid_rows = []
+                for row in cells:
+                    ids = np.asarray(row, dtype=int)
+                    ids = ids[(ids >= 0) & (ids < len(points))]
+                    if ids.size >= 1:
+                        valid_rows.append(ids)
+
+                if not valid_rows:
+                    continue
+
+                block_centers = np.array([points[ids].mean(axis=0) for ids in valid_rows], dtype=float)
+                centers_list.append(block_centers)
+                cell_block_sizes.append(len(block_centers))
+                cell_block_vertex_ids.extend(valid_rows)
+
+            if not centers_list:
+                centers = points.copy()
+                cell_block_sizes = [len(centers)]
+                cell_block_vertex_ids = [np.array([i], dtype=int) for i in range(len(points))]
+            else:
+                centers = np.vstack(centers_list)
+
+            def _candidate_names(data_dict):
+                return list(data_dict.keys()) if isinstance(data_dict, dict) else []
+
+            def _score_name(name):
+                lname = str(name).lower()
+                for i, pref in enumerate(preferred_order):
+                    lpref = str(pref).lower()
+                    if lname == lpref or lpref in lname:
+                        return i
+                return 999
+
+            scalar_name = None
+            scalar_values = None
+
+            # Prefer cell data because OpenFOAM internal.vtu commonly stores p/U on cells.
+            for name in sorted(_candidate_names(mesh.cell_data), key=_score_name):
+                try:
+                    data_blocks = mesh.cell_data.get(name)
+                    if not data_blocks:
                         continue
-                    if conn.ndim == 1:
-                        conn = conn.reshape((-1, 1))
 
-                    # Skip pure vertex/line blocks for volume/field visualization.
-                    if conn.shape[1] < 3:
-                        continue
+                    vals_parts = []
+                    candidate_name = str(name)
 
-                    valid_rows = []
-                    for row in conn:
-                        row = row[(row >= 0) & (row < len(points))]
-                        if row.size >= 3:
-                            valid_rows.append(row)
+                    for arr, n_cells in zip(data_blocks, cell_block_sizes):
+                        arr = np.asarray(arr)
+                        if arr.size == 0:
+                            continue
 
-                    if not valid_rows:
-                        continue
-
-                    centers_this_block = np.array(
-                        [np.mean(points[row], axis=0) for row in valid_rows],
-                        dtype=float,
-                    )
-
-                    block_centers.append(centers_this_block)
-                    block_node_ids.append(valid_rows)
-                    block_sizes.append(len(valid_rows))
-
-                if block_centers:
-                    centers = np.vstack(block_centers)
-
-                    def _candidate_field_names(container):
-                        try:
-                            return list(container.keys())
-                        except Exception:
-                            return []
-
-                    def _name_matches(name, preferred):
-                        nl = str(name).lower()
-                        pl = str(preferred).lower()
-                        return nl == pl or pl in nl
-
-                    scalar_name = None
-                    scalar_values = None
-                    scalar_location = None
-
-                    # Cell data in meshio is dict: field_name -> list[array per cell block].
-                    for preferred in preferred_order:
-                        for name in _candidate_field_names(mesh.cell_data):
-                            if not _name_matches(name, preferred):
-                                continue
-
-                            arrays = mesh.cell_data.get(name, [])
-                            vals_per_block = []
-                            used_block_i = 0
-
-                            for arr in arrays:
-                                arr = np.asarray(arr)
-                                # mesh.cell_data arrays include all cell blocks, but we skipped
-                                # vertex/line blocks. Match by length to accepted cell blocks.
-                                while used_block_i < len(block_sizes):
-                                    expected = block_sizes[used_block_i]
-                                    if arr.shape[0] == expected:
-                                        break
-                                    used_block_i += 1
-
-                                if used_block_i >= len(block_sizes):
-                                    continue
-
-                                if arr.ndim == 1:
-                                    vals = arr.astype(float)
-                                elif arr.ndim >= 2 and arr.shape[1] >= 3:
-                                    vals = np.linalg.norm(arr[:, :3].astype(float), axis=1)
-                                else:
-                                    vals = arr.reshape((arr.shape[0], -1))[:, 0].astype(float)
-
-                                vals_per_block.append(vals[:block_sizes[used_block_i]])
-                                used_block_i += 1
-
-                            if vals_per_block:
-                                scalar_values = np.concatenate(vals_per_block)
-                                scalar_name = str(name) if np.ndim(vals_per_block[0]) == 1 else f"{name} magnitude"
-                                scalar_location = "cell"
-                                break
-
-                        if scalar_values is not None:
-                            break
-
-                    # Point data fallback. Average point field values to cell centers.
-                    if scalar_values is None:
-                        for preferred in preferred_order:
-                            for name in _candidate_field_names(mesh.point_data):
-                                if not _name_matches(name, preferred):
-                                    continue
-
-                                arr = np.asarray(mesh.point_data.get(name))
-                                if arr.size == 0 or arr.shape[0] != len(points):
-                                    continue
-
-                                if arr.ndim == 1:
-                                    point_vals = arr.astype(float)
-                                    cell_vals = []
-                                    for rows in block_node_ids:
-                                        cell_vals.extend([float(np.nanmean(point_vals[row])) for row in rows])
-                                    scalar_values = np.asarray(cell_vals, dtype=float)
-                                    scalar_name = str(name)
-                                elif arr.ndim >= 2 and arr.shape[1] >= 3:
-                                    point_vals = np.linalg.norm(arr[:, :3].astype(float), axis=1)
-                                    cell_vals = []
-                                    for rows in block_node_ids:
-                                        cell_vals.extend([float(np.nanmean(point_vals[row])) for row in rows])
-                                    scalar_values = np.asarray(cell_vals, dtype=float)
-                                    scalar_name = f"{name} magnitude"
-                                scalar_location = "point"
-                                break
-
-                            if scalar_values is not None:
-                                break
-
-                    # Last-resort field: first usable cell_data or point_data field.
-                    if scalar_values is None:
-                        for name in _candidate_field_names(mesh.cell_data):
-                            arrays = mesh.cell_data.get(name, [])
-                            vals_per_block = []
-                            for arr, expected in zip(arrays, block_sizes):
-                                arr = np.asarray(arr)
-                                if arr.shape[0] != expected:
-                                    continue
-                                if arr.ndim == 1:
-                                    vals_per_block.append(arr.astype(float))
-                                elif arr.ndim >= 2 and arr.shape[1] >= 3:
-                                    vals_per_block.append(np.linalg.norm(arr[:, :3].astype(float), axis=1))
-                                else:
-                                    vals_per_block.append(arr.reshape((arr.shape[0], -1))[:, 0].astype(float))
-                            if vals_per_block:
-                                scalar_values = np.concatenate(vals_per_block)
-                                scalar_name = str(name)
-                                scalar_location = "cell"
-                                break
-
-                    intensity = None
-                    if scalar_values is not None and len(scalar_values) > 0:
-                        vals = np.asarray(scalar_values, dtype=float).reshape(-1)
-                        if vals.size >= len(centers):
-                            intensity = vals[:len(centers)]
+                        if arr.ndim == 2 and arr.shape[1] >= 3:
+                            vals = np.linalg.norm(arr[:, :3].astype(float), axis=1)
+                            candidate_name = f"{name} magnitude"
                         else:
-                            intensity = np.full(len(centers), float(np.nanmean(vals)))
+                            vals = arr.reshape(-1).astype(float)
+                            candidate_name = str(name)
 
-                    # Downsample evenly for browser performance.
-                    if len(centers) > max_points:
-                        keep = np.linspace(0, len(centers) - 1, max_points).astype(int)
-                        centers = centers[keep]
-                        if intensity is not None:
-                            intensity = intensity[keep]
+                        vals_parts.append(vals[:n_cells])
 
-                    return {
-                        "path": str(vtk_path),
-                        "centers": centers,
-                        "intensity": intensity,
-                        "scalar_name": scalar_name,
-                        "domain_points": points,
-                        "reader": "meshio",
-                        "scalar_location": scalar_location,
-                        "available_point_fields": list(mesh.point_data.keys()),
-                        "available_cell_fields": list(mesh.cell_data.keys()),
-                    }
+                    if vals_parts:
+                        scalar_values = np.concatenate(vals_parts)
+                        scalar_name = candidate_name
+                        break
+                except Exception:
+                    continue
+
+            # Fall back to point data. Average point values onto cell centers.
+            if scalar_values is None:
+                for name in sorted(_candidate_names(mesh.point_data), key=_score_name):
+                    try:
+                        arr = np.asarray(mesh.point_data.get(name))
+                        if arr.size == 0:
+                            continue
+
+                        if arr.ndim == 2 and arr.shape[1] >= 3:
+                            point_vals = np.linalg.norm(arr[:, :3].astype(float), axis=1)
+                            candidate_name = f"{name} magnitude"
+                        else:
+                            point_vals = arr.reshape(-1).astype(float)
+                            candidate_name = str(name)
+
+                        vals = []
+                        for ids in cell_block_vertex_ids:
+                            ids = ids[(ids >= 0) & (ids < len(point_vals))]
+                            if ids.size:
+                                vals.append(float(np.nanmean(point_vals[ids])))
+                        if vals:
+                            scalar_values = np.asarray(vals, dtype=float)
+                            scalar_name = candidate_name
+                            break
+                    except Exception:
+                        continue
+
+            intensity = None
+            if scalar_values is not None and np.asarray(scalar_values).size:
+                vals = np.asarray(scalar_values, dtype=float).reshape(-1)
+                if vals.size >= len(centers):
+                    intensity = vals[:len(centers)]
+                elif vals.size:
+                    intensity = np.full(len(centers), float(np.nanmean(vals)), dtype=float)
+
+            if len(centers) > max_points:
+                keep = np.linspace(0, len(centers) - 1, max_points).astype(int)
+                centers = centers[keep]
+                if intensity is not None and len(intensity) >= len(keep):
+                    intensity = intensity[keep]
+
+            return {
+                "path": str(vtk_path),
+                "centers": centers,
+                "intensity": intensity,
+                "scalar_name": scalar_name or "meshio field",
+                "domain_points": points,
+            }
 
         except Exception:
-            # Fall through to the ASCII XML parser below. Do not raise here because
-            # some old local foamToVTK files are ASCII and still work with the
-            # original parser.
+            # Continue into the legacy ASCII parser below.
             pass
 
-    # Legacy fallback: old ASCII .vtk reader for non-XML files.
+    # FALLBACK: legacy ASCII XML parser.
+    import xml.etree.ElementTree as ET
+
     if vtk_path.suffix.lower() not in [".vtu", ".vtp"]:
         data = read_openfoam_visual_file(vtk_path, max_cells=max_points, preferred_fields=preferred_fields)
         if data is None:
@@ -4290,13 +4245,7 @@ def read_openfoam_field_points(vtk_path, preferred_fields=None, max_points=12000
             "intensity": intensity,
             "scalar_name": data.get("scalar_name"),
             "domain_points": pts,
-            "reader": "legacy_vtk",
         }
-
-    # ---------------------------------------------------------------------
-    # Fallback reader: ASCII XML only. This will not parse binary/appended VTU.
-    # ---------------------------------------------------------------------
-    import xml.etree.ElementTree as ET
 
     try:
         root = ET.parse(vtk_path).getroot()
@@ -4330,17 +4279,14 @@ def read_openfoam_field_points(vtk_path, preferred_fields=None, max_points=12000
     points_elem = find_first(piece, "Points")
     if points_elem is None:
         return None
-
     point_da = None
     for da in points_elem.iter():
         if strip_ns(da.tag) == "DataArray":
             point_da = da
             break
-
     pts_flat = parse_array_text(point_da, float)
     if pts_flat.size < 9:
         return None
-
     points = pts_flat.reshape((-1, 3))
 
     cell_ids = []
@@ -4358,10 +4304,10 @@ def read_openfoam_field_points(vtk_path, preferred_fields=None, max_points=12000
                     offsets = parse_array_text(da, int)
         if connectivity is None or offsets is None or offsets.size == 0:
             return None
-        start = 0
+        start_i = 0
         for off in offsets:
-            ids = connectivity[start:int(off)]
-            start = int(off)
+            ids = connectivity[start_i:int(off)]
+            start_i = int(off)
             ids = ids[(ids >= 0) & (ids < len(points))]
             if ids.size >= 3:
                 cell_ids.append(np.unique(ids))
@@ -4379,10 +4325,10 @@ def read_openfoam_field_points(vtk_path, preferred_fields=None, max_points=12000
                     offsets = parse_array_text(da, int)
         if connectivity is None or offsets is None or offsets.size == 0:
             return None
-        start = 0
+        start_i = 0
         for off in offsets:
-            ids = connectivity[start:int(off)]
-            start = int(off)
+            ids = connectivity[start_i:int(off)]
+            start_i = int(off)
             ids = ids[(ids >= 0) & (ids < len(points))]
             if ids.size >= 3:
                 cell_ids.append(np.unique(ids))
@@ -4464,9 +4410,7 @@ def read_openfoam_field_points(vtk_path, preferred_fields=None, max_points=12000
         "intensity": intensity,
         "scalar_name": scalar_name,
         "domain_points": points,
-        "reader": "ascii_xml",
     }
-
 
 def filter_field_points_for_centered_submerged_view(field_data, bounds_m=None, front_selection="+X front", max_points=120000):
     """
