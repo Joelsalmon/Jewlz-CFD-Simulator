@@ -9,3 +9,4 @@ pillow
 scipy
 coolprop
 meshio
+matplotlib
