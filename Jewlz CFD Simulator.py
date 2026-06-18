@@ -7802,6 +7802,24 @@ def make_fluidforce_pdf_report(
         story.append(table_from_rows(cfd_result_rows))
 
     if report_images:
+        # Final safety de-duplication so the same PNG/page is never inserted twice.
+        try:
+            _deduped_report_images = []
+            _seen_report_titles = set()
+            for _img in report_images:
+                if not isinstance(_img, dict):
+                    continue
+                _title_key = str(_img.get("title", "")).strip().lower()
+                _data_len = len(_img.get("data") or b"")
+                _key = (_title_key, _data_len)
+                if _key in _seen_report_titles:
+                    continue
+                _seen_report_titles.add(_key)
+                _deduped_report_images.append(_img)
+            report_images = _deduped_report_images
+        except Exception:
+            pass
+
         story.append(PageBreak())
         story.append(Paragraph("CFD and Engineering Visualizations", section_style))
         story.append(Paragraph(
@@ -9554,9 +9572,23 @@ with tab5:
                     # Streamlit reruns clear local variables before PDF export.
                     cached_count = append_session_cached_cfd_visuals(report_images)
 
-                    # Backup path: if no CFD visuals are cached, try to rebuild them
-                    # from the latest completed CFD case folder.
-                    if cached_count == 0:
+                    # Do not assume cached visuals are complete. The PDF must include
+                    # pressure and velocity PNGs, so rebuild them from the latest
+                    # completed OpenFOAM case whenever either one is missing.
+                    def _pdf_has_title_contains(items, *needles):
+                        try:
+                            for _item in items or []:
+                                _title = str((_item or {}).get("title", "")).lower()
+                                _has_data = bool((_item or {}).get("data"))
+                                if _has_data and all(str(n).lower() in _title for n in needles):
+                                    return True
+                        except Exception:
+                            pass
+                        return False
+
+                    _has_pressure_png = _pdf_has_title_contains(report_images, "pressure")
+                    _has_velocity_png = _pdf_has_title_contains(report_images, "velocity") or _pdf_has_title_contains(report_images, "wake")
+                    if not (_has_pressure_png and _has_velocity_png):
                         append_latest_openfoam_visuals_to_report(
                             report_images,
                             coords_m=coords_m,
@@ -9570,23 +9602,27 @@ with tab5:
                             show_openfoam_fluid_field=show_openfoam_fluid_field,
                         )
 
-                    force_fig_for_report = make_force_vector_figure(
-                        coords_m, faces, bounds_m, front_selection, fd, fl,
-                        rho=rho, velocity=velocity, static_pressure=pressure_pa, side_force=0.0
-                    )
-                    force_png_for_report = plotly_fig_to_png_bytes(force_fig_for_report)
-                    cache_cfd_report_visual(
-                        "cached_cfd_force_visual",
-                        "Dynamic Force Vector and Pressure Loading View",
-                        force_png_for_report,
-                        "Object pressure-loading map scaled to the calculated drag, lift, and side-force values.",
-                    )
-                    add_report_image(
-                        report_images,
-                        "Dynamic Force Vector and Pressure Loading View",
-                        data=force_png_for_report,
-                        caption="Object pressure-loading map scaled to the calculated drag, lift, and side-force values.",
-                    )
+                    # Add the force figure only once. It may already exist in the
+                    # session cache from a previous rerun.
+                    _has_force_png = _pdf_has_title_contains(report_images, "force")
+                    if not _has_force_png:
+                        force_fig_for_report = make_force_vector_figure(
+                            coords_m, faces, bounds_m, front_selection, fd, fl,
+                            rho=rho, velocity=velocity, static_pressure=pressure_pa, side_force=0.0
+                        )
+                        force_png_for_report = plotly_fig_to_png_bytes(force_fig_for_report)
+                        cache_cfd_report_visual(
+                            "cached_cfd_force_visual",
+                            "Dynamic Force Vector and Pressure Loading View",
+                            force_png_for_report,
+                            "Object pressure-loading map scaled to the calculated drag, lift, and side-force values.",
+                        )
+                        add_report_image(
+                            report_images,
+                            "Dynamic Force Vector and Pressure Loading View",
+                            data=force_png_for_report,
+                            caption="Object pressure-loading map scaled to the calculated drag, lift, and side-force values.",
+                        )
             except Exception as pdf_visual_error:
                 report_images = []
                 st.warning(f"PDF visual preparation failed: {pdf_visual_error}")
