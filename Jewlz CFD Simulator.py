@@ -226,6 +226,44 @@ def _filter_near_object_points(points, object_mesh, values, max_points=18000, di
         vals = vals[idx]
     return pts, vals
 
+
+
+def _nearest_values_to_vertices(vertices, points, values, max_vertices=25000):
+    """Map CFD point values onto the uploaded object surface for object-color gradients."""
+    try:
+        vertices = np.asarray(vertices, dtype=float)
+        points = np.asarray(points, dtype=float)
+        values = np.asarray(values, dtype=float).reshape(-1)
+        n = min(len(points), len(values))
+        points = points[:n]
+        values = values[:n]
+        good = np.isfinite(points).all(axis=1) & np.isfinite(values)
+        points = points[good]
+        values = values[good]
+        if vertices.ndim != 2 or vertices.shape[1] < 3 or len(vertices) == 0 or len(points) == 0:
+            return None
+        # Fast path when SciPy is available on Streamlit Cloud.
+        try:
+            from scipy.spatial import cKDTree
+            tree = cKDTree(points[:, :3])
+            _, nearest = tree.query(vertices[:, :3], k=1, workers=-1)
+            return values[np.asarray(nearest, dtype=int)]
+        except Exception:
+            # Safe fallback: sample the CFD cloud and calculate nearest values in chunks.
+            if len(points) > 8000:
+                step = max(1, len(points) // 8000)
+                points = points[::step]
+                values = values[::step]
+            out = np.zeros(len(vertices), dtype=float)
+            chunk = 500
+            for start in range(0, len(vertices), chunk):
+                v = vertices[start:start + chunk, :3]
+                d2 = ((v[:, None, :] - points[None, :, :3]) ** 2).sum(axis=2)
+                out[start:start + chunk] = values[np.argmin(d2, axis=1)]
+            return out
+    except Exception:
+        return None
+
 def backend_visual_mesh_figure(case_dir, field_mode="pressure", max_points=18000):
     """Interactive 3D CFD visual from backend-generated JSON. Only pressure/velocity views."""
     data, msg = load_backend_visual_mesh(case_dir)
@@ -273,16 +311,26 @@ def backend_visual_mesh_figure(case_dir, field_mode="pressure", max_points=18000
             jj = object_mesh.get("j", [])
             kk = object_mesh.get("k", [])
             if verts.ndim == 2 and verts.shape[1] == 3 and len(verts) > 0 and len(ii) > 0:
-                fig.add_trace(go.Mesh3d(
+                object_vals = _nearest_values_to_vertices(verts, pts_plot, vals_plot)
+                mesh_kwargs = dict(
                     x=verts[:, 0], y=verts[:, 1], z=verts[:, 2],
                     i=ii, j=jj, k=kk,
-                    name="Uploaded Object Surface",
-                    color="lightgray",
-                    opacity=0.78,
+                    name="Uploaded Object Surface — CFD Field Gradient",
+                    opacity=0.94,
                     flatshading=True,
-                    hovertemplate="Uploaded object surface<extra></extra>",
+                    hovertemplate="Uploaded object surface<br>mapped field=%{intensity:.6g}<extra></extra>",
                     showscale=False,
-                ))
+                )
+                if object_vals is not None and len(object_vals) == len(verts):
+                    mesh_kwargs.update(
+                        intensity=object_vals,
+                        colorscale=colorscale,
+                        cmin=cmin,
+                        cmax=cmax,
+                    )
+                else:
+                    mesh_kwargs.update(color="lightgray")
+                fig.add_trace(go.Mesh3d(**mesh_kwargs))
         except Exception:
             pass
 
@@ -290,10 +338,10 @@ def backend_visual_mesh_figure(case_dir, field_mode="pressure", max_points=18000
         x=pts_plot[:, 0], y=pts_plot[:, 1], z=pts_plot[:, 2],
         mode="markers",
         marker=dict(
-            size=2,
+            size=1.6,
             color=vals_plot,
             colorscale=colorscale,
-            opacity=0.82,
+            opacity=0.38,
             cmin=cmin,
             cmax=cmax,
             colorbar=dict(title=colorbar_title, tickformat=".3g", len=0.82),
@@ -8410,13 +8458,25 @@ with tab4:
                         mime="application/zip",
                     )
 
+                    st.session_state["latest_remote_cfd_case_dir"] = str(remote_case_dir)
+                    st.session_state["latest_remote_cfd_job_id"] = job_id
+                    st.session_state["latest_remote_cfd_zip"] = str(solved_zip_path)
+                    try:
+                        _remote_data, _remote_msg = load_backend_visual_mesh(remote_case_dir)
+                        if _remote_data is not None:
+                            st.session_state["latest_remote_cfd_visual_data"] = _remote_data
+                    except Exception:
+                        pass
+
                     render_remote_backend_visuals(remote_case_dir)
 
                 except Exception as e:
                     remote_status.error(f"Remote CFD backend failed: {e}")
                     remote_progress.progress(1.0)
 
-                st.stop()
+                # Continue rendering the rest of the engineering/force/plot tabs.
+                # Do not call st.stop() here; stopping the script makes the Engineering Forces,
+                # Force Vectors, Plots, and Design Optimization tabs appear blank after a remote CFD run.
 
             if ok and run_case_after_generation:
                 progress_box = st.container()
@@ -9036,6 +9096,8 @@ net_force_auto = net_force_at_velocity(fd_auto, mass_kg, volume_for_calc, rho)
 
 with tab8:
     st.subheader("CFD Design Optimization Mode")
+    if "latest_remote_cfd_visual_data" in st.session_state:
+        st.caption("Remote CFD results are available. Optimization remains a fast screening model; rerun OpenFOAM on the selected design for final validation.")
     st.write(
         "This mode screens design changes before running full OpenFOAM CFD. "
         "It ranks candidate geometry modifications using the current fluid, velocity, reference area, Reynolds number, and force equations. "
@@ -9152,6 +9214,16 @@ with tab8:
 
 with tab5:
     st.subheader("Detected Simulation Mode")
+
+    if "latest_remote_cfd_visual_data" in st.session_state:
+        _rd = st.session_state.get("latest_remote_cfd_visual_data") or {}
+        _meta = _rd.get("metadata", {}) if isinstance(_rd, dict) else {}
+        st.success("Remote Docker/OpenFOAM results are loaded. Engineering values below remain tied to the uploaded geometry and selected inputs.")
+        r1, r2, r3, r4 = st.columns(4)
+        r1.metric("Remote CFD Points", f"{int(_meta.get('n_points', 0)):,}")
+        r2.metric("p min / max", f"{_meta.get('pressure_min', 0):.3g} / {_meta.get('pressure_max', 0):.3g} Pa")
+        r3.metric("|U| min / max", f"{_meta.get('velocity_min', 0):.3g} / {_meta.get('velocity_max', 0):.3g} m/s")
+        r4.metric("Remote Job", str(st.session_state.get("latest_remote_cfd_job_id", "loaded")))
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Mode", mode)
@@ -9419,6 +9491,9 @@ with tab5:
 with tab6:
     st.subheader("Force Vector Visualization")
 
+    if "latest_remote_cfd_visual_data" in st.session_state:
+        st.caption("Remote CFD has been loaded. The vector view below stays visible and uses the current calculated force model; the 3D CFD tab shows the OpenFOAM pressure/velocity surface gradients.")
+
     if geom is not None:
         st.info("This view shows pressure loading scaled to the calculated drag, lift, and side-force results. Red regions carry the highest calculated pressure loading.")
         fig_forces = make_force_vector_figure(
@@ -9448,6 +9523,9 @@ with tab6:
 
 with tab7:
     st.subheader("Force vs Velocity Plot")
+
+    if "latest_remote_cfd_visual_data" in st.session_state:
+        st.caption("Plot section is active after remote CFD. These curves are calculated from the selected fluid, geometry, and force model so you can compare against OpenFOAM results.")
 
     plot_area = default_area
     plot_cd = estimate_cd("Custom/unknown uploaded geometry")
