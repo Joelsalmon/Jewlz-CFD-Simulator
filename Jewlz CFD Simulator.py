@@ -358,14 +358,91 @@ def _nearest_values_to_vertices(vertices, points, values, max_vertices=25000):
         return None
 
 
-def backend_visual_mesh_figure(case_dir, field_mode="pressure", max_points=18000, rho_ref=1.225, static_pressure_ref=101325.0):
+def _front_axis_and_sign(front_selection):
+    """Return selected front axis index and sign for pressure-gradient fallback."""
+    try:
+        fs = str(front_selection or "+X front").strip().upper()
+        sign = -1.0 if fs.startswith("-") else 1.0
+        if "Y" in fs:
+            axis = 1
+        elif "Z" in fs:
+            axis = 2
+        else:
+            axis = 0
+        return axis, sign
+    except Exception:
+        return 0, 1.0
+
+
+def _normalized_surface_pressure_coordinate(points, front_selection=None):
+    """Geometric fallback: 0 at low-pressure side, 1 at selected incoming/front face."""
+    pts = np.asarray(points, dtype=float)
+    if pts.ndim != 2 or pts.shape[1] < 3 or len(pts) == 0:
+        return np.zeros(len(pts), dtype=float)
+    axis, sign = _front_axis_and_sign(front_selection)
+    c = pts[:, axis]
+    cmin = float(np.nanmin(c))
+    cmax = float(np.nanmax(c))
+    if not np.isfinite(cmin) or not np.isfinite(cmax) or abs(cmax - cmin) < 1e-18:
+        return np.zeros(len(pts), dtype=float)
+    coord_norm = (c - cmin) / (cmax - cmin)
+    # +X/+Y/+Z front means the high-pressure side is the max coordinate side.
+    # -X/-Y/-Z front means the high-pressure side is the min coordinate side.
+    if sign < 0:
+        coord_norm = 1.0 - coord_norm
+    return np.clip(coord_norm, 0.0, 1.0)
+
+
+def _scaled_pressure_from_openfoam_or_geometry(points, raw_openfoam_pressure, rho_ref, pressure_low, pressure_high, front_selection=None):
+    """
+    Convert OpenFOAM incompressible pressure to a display pressure range.
+
+    The low/high pressure values come from the app physics:
+      low  = pressure from fluid lookup at input gas temperature / mass-flow state
+      high = calculated pressure on the object
+
+    The OpenFOAM pressure distribution sets the shape of the gradient. If the exported
+    OpenFOAM p field is flat/near-zero, use a geometric stagnation-side fallback so the
+    surface still shows the expected front-to-back pressure loading.
+    """
+    pts = np.asarray(points, dtype=float)
+    p_low = float(min(float(pressure_low), float(pressure_high)))
+    p_high = float(max(float(pressure_low), float(pressure_high)))
+    if abs(p_high - p_low) < 1e-18:
+        p_high = p_low + max(abs(p_low), 1.0) * 1e-6
+
+    norm = None
+    if raw_openfoam_pressure is not None:
+        try:
+            gauge_pa = _openfoam_pressure_to_gauge_pa(raw_openfoam_pressure, rho_ref=rho_ref)
+            gauge_pa = np.asarray(gauge_pa, dtype=float).reshape(-1)
+            n = min(len(pts), len(gauge_pa))
+            g = gauge_pa[:n]
+            valid = np.isfinite(g)
+            if np.count_nonzero(valid) > 4:
+                gmin = float(np.nanmin(g[valid]))
+                gmax = float(np.nanmax(g[valid]))
+                if abs(gmax - gmin) > max(1e-12, abs(gmax) * 1e-9, abs(gmin) * 1e-9):
+                    norm = np.zeros(len(pts), dtype=float)
+                    norm[:n] = np.clip((g - gmin) / (gmax - gmin), 0.0, 1.0)
+        except Exception:
+            norm = None
+
+    if norm is None or len(norm) != len(pts):
+        norm = _normalized_surface_pressure_coordinate(pts, front_selection=front_selection)
+
+    return p_low + norm * (p_high - p_low)
+
+
+def backend_visual_mesh_figure(case_dir, field_mode="pressure", max_points=18000, rho_ref=1.225, static_pressure_ref=101325.0, calculated_pressure_ref=None, front_selection=None):
     """Interactive 3D CFD visual from backend JSON.
 
-    Pressure view uses absolute pressure on the object surface:
-        p_abs = p_static_at_input_temperature + rho * p_OpenFOAM
+    Pressure view uses a clean engineering pressure scale:
+      min = pressure from fluid lookup at input gas temperature / mass-flow state
+      max = calculated pressure on the object
 
-    The OpenFOAM incompressible pressure field is retained as the source field, but converted
-    to Pa gauge pressure first, then offset by the resolved/static pressure used by the app.
+    OpenFOAM p supplies the pressure-gradient shape. If OpenFOAM exports a flat p field,
+    a geometric front-face fallback is used so the object surface still shows loading.
     """
     data, msg = load_backend_visual_mesh(case_dir)
     if data is None:
@@ -381,10 +458,18 @@ def backend_visual_mesh_figure(case_dir, field_mode="pressure", max_points=18000
         colorscale = "Turbo"
     else:
         raw_p = data.get("pressure")
-        gauge_pa = _openfoam_pressure_to_gauge_pa(raw_p, rho_ref=rho_ref) if raw_p is not None else None
-        vals_full = (float(static_pressure_ref) + gauge_pa) if gauge_pa is not None else None
-        title = "Remote OpenFOAM Near-Surface Absolute Pressure Field"
-        colorbar_title = "Absolute Pressure [Pa]"
+        p_low = float(static_pressure_ref)
+        p_high = float(calculated_pressure_ref) if calculated_pressure_ref is not None else p_low
+        vals_full = _scaled_pressure_from_openfoam_or_geometry(
+            pts,
+            raw_p,
+            rho_ref=rho_ref,
+            pressure_low=p_low,
+            pressure_high=p_high,
+            front_selection=front_selection,
+        )
+        title = "Remote OpenFOAM Surface Pressure Gradient"
+        colorbar_title = "Surface Pressure [Pa]"
         colorscale = "Jet"
 
     if vals_full is None or len(vals_full) != len(pts):
@@ -464,7 +549,7 @@ def backend_visual_mesh_figure(case_dir, field_mode="pressure", max_points=18000
     return fig, None
 
 
-def render_remote_backend_visuals(remote_case_dir, rho_ref=1.225, static_pressure_ref=101325.0):
+def render_remote_backend_visuals(remote_case_dir, rho_ref=1.225, static_pressure_ref=101325.0, calculated_pressure_ref=None, front_selection=None):
     """Render pressure and velocity views from the remote backend solved ZIP."""
     st.subheader("Remote Docker/OpenFOAM 3D Results")
     data, msg = load_backend_visual_mesh(remote_case_dir)
@@ -477,12 +562,14 @@ def render_remote_backend_visuals(remote_case_dir, rho_ref=1.225, static_pressur
         field_mode="pressure",
         rho_ref=rho_ref,
         static_pressure_ref=static_pressure_ref,
+        calculated_pressure_ref=calculated_pressure_ref,
+        front_selection=front_selection,
     )
     velocity_fig, velocity_msg = backend_visual_mesh_figure(remote_case_dir, field_mode="velocity")
 
     if pressure_fig is not None:
         st.plotly_chart(pressure_fig, use_container_width=True)
-        st.caption("Pressure view uses absolute surface pressure from OpenFOAM: p_absolute = p_static_at_input_temperature + rho*p_OpenFOAM. Dynamic pressure remains in the dynamic force visualization.")
+        st.caption("Pressure view scale: minimum = resolved fluid pressure at input temperature/mass-flow state; maximum = calculated object pressure. OpenFOAM pressure sets the gradient shape; dynamic pressure remains in the force visualization.")
     elif pressure_msg:
         st.warning(pressure_msg)
 
@@ -8374,7 +8461,13 @@ with tab4:
                     except Exception:
                         pass
 
-                    render_remote_backend_visuals(remote_case_dir, rho_ref=rho, static_pressure_ref=pressure_pa)
+                    render_remote_backend_visuals(
+                            remote_case_dir,
+                            rho_ref=rho,
+                            static_pressure_ref=pressure_pa,
+                            calculated_pressure_ref=(pressure_pa + 0.5 * rho * velocity**2),
+                            front_selection=front_selection,
+                        )
 
                 except Exception as e:
                     remote_status.error(f"Remote CFD backend failed: {e}")
