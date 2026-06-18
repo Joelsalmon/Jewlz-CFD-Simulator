@@ -359,7 +359,14 @@ def _nearest_values_to_vertices(vertices, points, values, max_vertices=25000):
 
 
 def backend_visual_mesh_figure(case_dir, field_mode="pressure", max_points=18000, rho_ref=1.225, static_pressure_ref=101325.0):
-    """Interactive 3D CFD visual from backend JSON. Pressure view uses OpenFOAM gauge pressure."""
+    """Interactive 3D CFD visual from backend JSON.
+
+    Pressure view uses absolute pressure on the object surface:
+        p_abs = p_static_at_input_temperature + rho * p_OpenFOAM
+
+    The OpenFOAM incompressible pressure field is retained as the source field, but converted
+    to Pa gauge pressure first, then offset by the resolved/static pressure used by the app.
+    """
     data, msg = load_backend_visual_mesh(case_dir)
     if data is None:
         return None, msg
@@ -374,9 +381,10 @@ def backend_visual_mesh_figure(case_dir, field_mode="pressure", max_points=18000
         colorscale = "Turbo"
     else:
         raw_p = data.get("pressure")
-        vals_full = _openfoam_pressure_to_gauge_pa(raw_p, rho_ref=rho_ref) if raw_p is not None else None
-        title = "Remote OpenFOAM Near-Surface Gauge Pressure Field"
-        colorbar_title = "OpenFOAM Gauge Pressure [Pa]"
+        gauge_pa = _openfoam_pressure_to_gauge_pa(raw_p, rho_ref=rho_ref) if raw_p is not None else None
+        vals_full = (float(static_pressure_ref) + gauge_pa) if gauge_pa is not None else None
+        title = "Remote OpenFOAM Near-Surface Absolute Pressure Field"
+        colorbar_title = "Absolute Pressure [Pa]"
         colorscale = "Jet"
 
     if vals_full is None or len(vals_full) != len(pts):
@@ -474,7 +482,7 @@ def render_remote_backend_visuals(remote_case_dir, rho_ref=1.225, static_pressur
 
     if pressure_fig is not None:
         st.plotly_chart(pressure_fig, use_container_width=True)
-        st.caption("Pressure view uses OpenFOAM gauge pressure: p_gauge = rho*p_OpenFOAM. Static/absolute pressure remains a reference value in the sidebar/results, and dynamic pressure remains in the dynamic force visualization.")
+        st.caption("Pressure view uses absolute surface pressure from OpenFOAM: p_absolute = p_static_at_input_temperature + rho*p_OpenFOAM. Dynamic pressure remains in the dynamic force visualization.")
     elif pressure_msg:
         st.warning(pressure_msg)
 
