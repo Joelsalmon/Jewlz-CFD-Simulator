@@ -647,12 +647,42 @@ def render_remote_backend_visuals(remote_case_dir, rho_ref=1.225, static_pressur
     if pressure_fig is not None:
         st.plotly_chart(pressure_fig, use_container_width=True)
         st.caption("Pressure view uses the true OpenFOAM pressure distribution mapped to the object surface: p_absolute = p_static_reference + rho*p_OpenFOAM. The legend is the actual displayed field range, not an artificially divided gradient.")
+        # PDF FIX: cache the exact remote pressure Plotly view as PNG the moment it is shown.
+        # The main PDF button often runs after a Streamlit rerun, so relying on local variables
+        # is not reliable. This creates both session-state and file-backed cache entries.
+        try:
+            pressure_png = plotly_fig_to_png_bytes(pressure_fig, width=1700, height=1150, scale=2.0)
+            cache_cfd_report_visual(
+                "cached_cfd_pressure_visual",
+                "Actual OpenFOAM Pressure Field View",
+                pressure_png,
+                "Pressure distribution from the latest remote Docker/OpenFOAM CFD case. This is the same 3D pressure view shown in the simulator.",
+            )
+        except Exception as _e:
+            try:
+                st.session_state["pdf_visual_export_error"] = f"Remote pressure PNG export failed: {_e}"
+            except Exception:
+                pass
     elif pressure_msg:
         st.warning(pressure_msg)
 
     if velocity_fig is not None:
         st.plotly_chart(velocity_fig, use_container_width=True)
         st.caption("Velocity view uses the true OpenFOAM |U| distribution mapped to the object surface. The legend is the actual displayed field range, not an artificially divided gradient.")
+        # PDF FIX: cache the exact remote velocity Plotly view as PNG the moment it is shown.
+        try:
+            velocity_png = plotly_fig_to_png_bytes(velocity_fig, width=1700, height=1150, scale=2.0)
+            cache_cfd_report_visual(
+                "cached_cfd_velocity_visual",
+                "Actual OpenFOAM Velocity / Wake Field View",
+                velocity_png,
+                "Velocity/wake distribution from the latest remote Docker/OpenFOAM CFD case. This is the same 3D velocity view shown in the simulator.",
+            )
+        except Exception as _e:
+            try:
+                st.session_state["pdf_visual_export_error"] = f"Remote velocity PNG export failed: {_e}"
+            except Exception:
+                pass
     elif velocity_msg:
         st.warning(velocity_msg)
 
@@ -5714,6 +5744,119 @@ def append_latest_openfoam_visuals_to_report(
     return job
 
 
+def append_latest_remote_backend_visuals_to_report(
+    report_images,
+    front_selection="+X front",
+    rho=1.225,
+    velocity=30.0,
+    pressure_pa=101325.0,
+):
+    """
+    Adds pressure and velocity PNGs from the latest remote Docker/OpenFOAM solved case.
+
+    This is separate from the local OpenFOAM job database because the remote backend
+    extracts solved ZIPs into app_data_dir()/cases and stores the path in
+    st.session_state["latest_remote_cfd_case_dir"]. Without this bridge, the main
+    PDF can miss the remote pressure/velocity views even though they are visible in
+    Streamlit.
+    """
+    if report_images is None:
+        return 0
+
+    def _has_title_contains(items, *needles):
+        for _item in items or []:
+            try:
+                _title = str((_item or {}).get("title", "")).lower()
+                _has_data = bool((_item or {}).get("data"))
+                if _has_data and all(str(n).lower() in _title for n in needles):
+                    return True
+            except Exception:
+                pass
+        return False
+
+    # Candidate sources, in priority order: latest remote session case, cached zip extraction,
+    # and any recent remote_solved case under the app cases folder.
+    candidate_dirs = []
+    try:
+        ss_dir = st.session_state.get("latest_remote_cfd_case_dir")
+        if ss_dir:
+            candidate_dirs.append(Path(ss_dir))
+    except Exception:
+        pass
+    try:
+        cases_root = app_data_dir() / "cases"
+        if cases_root.exists():
+            candidate_dirs.extend(sorted(cases_root.glob("*_remote_solved"), key=lambda q: q.stat().st_mtime, reverse=True))
+    except Exception:
+        pass
+
+    added = 0
+    for case_dir in candidate_dirs:
+        try:
+            case_dir = Path(case_dir)
+            if not case_dir.exists() or find_backend_visual_mesh_json(case_dir) is None:
+                continue
+
+            if not _has_title_contains(report_images, "pressure"):
+                pressure_fig, pressure_msg = backend_visual_mesh_figure(
+                    case_dir,
+                    field_mode="pressure",
+                    rho_ref=rho,
+                    static_pressure_ref=pressure_pa,
+                    calculated_pressure_ref=(pressure_pa + 0.5 * rho * velocity ** 2),
+                    front_selection=front_selection,
+                    velocity_ref=velocity,
+                )
+                if pressure_fig is not None:
+                    pressure_png = plotly_fig_to_png_bytes(pressure_fig, width=1700, height=1150, scale=2.0)
+                    if pressure_png:
+                        cache_cfd_report_visual(
+                            "cached_cfd_pressure_visual",
+                            "Actual OpenFOAM Pressure Field View",
+                            pressure_png,
+                            "Pressure distribution from the latest remote Docker/OpenFOAM CFD case.",
+                        )
+                        report_images.append({
+                            "title": "Actual OpenFOAM Pressure Field View",
+                            "caption": "Pressure distribution from the latest remote Docker/OpenFOAM CFD case.",
+                            "data": pressure_png,
+                        })
+                        added += 1
+
+            if not (_has_title_contains(report_images, "velocity") or _has_title_contains(report_images, "wake")):
+                velocity_fig, velocity_msg = backend_visual_mesh_figure(
+                    case_dir,
+                    field_mode="velocity",
+                    front_selection=front_selection,
+                    velocity_ref=velocity,
+                )
+                if velocity_fig is not None:
+                    velocity_png = plotly_fig_to_png_bytes(velocity_fig, width=1700, height=1150, scale=2.0)
+                    if velocity_png:
+                        cache_cfd_report_visual(
+                            "cached_cfd_velocity_visual",
+                            "Actual OpenFOAM Velocity / Wake Field View",
+                            velocity_png,
+                            "Velocity/wake distribution from the latest remote Docker/OpenFOAM CFD case.",
+                        )
+                        report_images.append({
+                            "title": "Actual OpenFOAM Velocity / Wake Field View",
+                            "caption": "Velocity/wake distribution from the latest remote Docker/OpenFOAM CFD case.",
+                            "data": velocity_png,
+                        })
+                        added += 1
+
+            if added:
+                return added
+        except Exception as _e:
+            try:
+                st.session_state["pdf_visual_export_error"] = f"Remote CFD PDF visual export failed: {_e}"
+            except Exception:
+                pass
+            continue
+
+    return added
+
 
 
 def add_uploaded_object_overlay_to_openfoam_fig(fig, coords_m, faces):
@@ -9645,9 +9788,22 @@ with tab5:
                     # Streamlit reruns clear local variables before PDF export.
                     cached_count = append_session_cached_cfd_visuals(report_images)
 
-                    # Do not assume cached visuals are complete. The PDF must include
-                    # pressure and velocity PNGs, so rebuild them from the latest
-                    # completed OpenFOAM case whenever either one is missing.
+                    # Remote backend results do not always appear in the local CFD job DB.
+                    # Pull pressure/velocity directly from the latest remote solved case first.
+                    _has_pressure_png = _pdf_has_title_contains(report_images, "pressure")
+                    _has_velocity_png = _pdf_has_title_contains(report_images, "velocity") or _pdf_has_title_contains(report_images, "wake")
+                    if not (_has_pressure_png and _has_velocity_png):
+                        append_latest_remote_backend_visuals_to_report(
+                            report_images,
+                            front_selection=front_selection,
+                            rho=rho,
+                            velocity=velocity,
+                            pressure_pa=pressure_pa,
+                        )
+
+                    # Do not assume cached/remote visuals are complete. The PDF must include
+                    # pressure and velocity PNGs, so rebuild them from the latest local
+                    # completed OpenFOAM case whenever either one is still missing.
                     _has_pressure_png = _pdf_has_title_contains(report_images, "pressure")
                     _has_velocity_png = _pdf_has_title_contains(report_images, "velocity") or _pdf_has_title_contains(report_images, "wake")
                     if not (_has_pressure_png and _has_velocity_png):
