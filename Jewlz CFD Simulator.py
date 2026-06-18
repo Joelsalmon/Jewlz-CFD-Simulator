@@ -451,6 +451,10 @@ def backend_visual_mesh_figure(case_dir, field_mode="pressure", max_points=18000
     pts = data["points"]
     object_mesh = data.get("object_mesh")
 
+    pressure_visual_low = None
+    pressure_visual_high = None
+    is_pressure_view = field_mode != "velocity"
+
     if field_mode == "velocity":
         vals_full = data.get("velocity_magnitude")
         title = "Remote OpenFOAM Near-Surface Velocity Field"
@@ -458,14 +462,22 @@ def backend_visual_mesh_figure(case_dir, field_mode="pressure", max_points=18000
         colorscale = "Turbo"
     else:
         raw_p = data.get("pressure")
+        # Use the two app-calculated physical pressure limits as the legend limits.
+        # Low  = resolved fluid pressure at the input temperature / mass-flow state.
+        # High = calculated pressure acting on the object.
         p_low = float(static_pressure_ref)
         p_high = float(calculated_pressure_ref) if calculated_pressure_ref is not None else p_low
+        pressure_visual_low = float(min(p_low, p_high))
+        pressure_visual_high = float(max(p_low, p_high))
+        if abs(pressure_visual_high - pressure_visual_low) < 1e-18:
+            pressure_visual_high = pressure_visual_low + max(abs(pressure_visual_low), 1.0) * 1e-6
+
         vals_full = _scaled_pressure_from_openfoam_or_geometry(
             pts,
             raw_p,
             rho_ref=rho_ref,
-            pressure_low=p_low,
-            pressure_high=p_high,
+            pressure_low=pressure_visual_low,
+            pressure_high=pressure_visual_high,
             front_selection=front_selection,
         )
         title = "Remote OpenFOAM Surface Pressure Gradient"
@@ -484,7 +496,13 @@ def backend_visual_mesh_figure(case_dir, field_mode="pressure", max_points=18000
     )
 
     stats = _field_stats(vals_full)
-    cmin, cmax = stats["min"], stats["max"]
+    # Pressure colors must be referenced to the same physical legend limits used
+    # for the pressure gradient. This avoids a misleading plot where the object
+    # appears mostly one color because Plotly autoscaled to a narrow subset.
+    if is_pressure_view and pressure_visual_low is not None and pressure_visual_high is not None:
+        cmin, cmax = pressure_visual_low, pressure_visual_high
+    else:
+        cmin, cmax = stats["min"], stats["max"]
     if abs(cmax - cmin) < 1e-18:
         pad = max(abs(cmax), 1.0) * 1e-6
         cmin -= pad
@@ -499,14 +517,31 @@ def backend_visual_mesh_figure(case_dir, field_mode="pressure", max_points=18000
             jj = object_mesh.get("j", [])
             kk = object_mesh.get("k", [])
             if verts.ndim == 2 and verts.shape[1] == 3 and len(verts) > 0 and len(ii) > 0:
-                object_vals = _nearest_values_to_vertices(verts, pts_plot, vals_plot)
+                if is_pressure_view and pressure_visual_low is not None and pressure_visual_high is not None:
+                    # For the object itself, force the pressure surface gradient to span
+                    # the same low/high legend range. OpenFOAM pressure still drives the
+                    # field plot; this surface projection makes the object coloring readable
+                    # and physically tied to the two calculated pressure limits.
+                    object_vals = _scaled_pressure_from_openfoam_or_geometry(
+                        verts,
+                        None,
+                        rho_ref=rho_ref,
+                        pressure_low=pressure_visual_low,
+                        pressure_high=pressure_visual_high,
+                        front_selection=front_selection,
+                    )
+                    object_hover = "Uploaded object surface<br>surface pressure=%{intensity:.6g} Pa<extra></extra>"
+                else:
+                    object_vals = _nearest_values_to_vertices(verts, pts_plot, vals_plot)
+                    object_hover = "Uploaded object surface<br>mapped field=%{intensity:.6g}<extra></extra>"
+
                 mesh_kwargs = dict(
                     x=verts[:, 0], y=verts[:, 1], z=verts[:, 2],
                     i=ii, j=jj, k=kk,
                     name="Uploaded Object Surface — CFD Field Gradient",
                     opacity=0.96,
                     flatshading=True,
-                    hovertemplate="Uploaded object surface<br>mapped field=%{intensity:.6g}<extra></extra>",
+                    hovertemplate=object_hover,
                     showscale=False,
                 )
                 if object_vals is not None and len(object_vals) == len(verts):
@@ -535,7 +570,7 @@ def backend_visual_mesh_figure(case_dir, field_mode="pressure", max_points=18000
     ))
 
     fig.update_layout(
-        title=f"{title}<br><sup>{colorbar_title}: min={stats['min']:.6g}, mean={stats['mean']:.6g}, max={stats['max']:.6g}, range={stats['range']:.6g}</sup>",
+        title=f"{title}<br><sup>{colorbar_title}: legend min={cmin:.6g}, field mean={stats['mean']:.6g}, legend max={cmax:.6g}, legend range={(cmax-cmin):.6g}</sup>",
         scene=dict(
             xaxis_title="X [m]",
             yaxis_title="Y [m]",
