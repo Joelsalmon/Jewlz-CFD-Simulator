@@ -4223,11 +4223,10 @@ def add_actual_object_boundary_patch(
 
     Pressure mode:
       - OpenFOAM incompressible simpleFoam writes p as kinematic pressure p/rho [m²/s²].
-      - For CFD forces and object gradients, the app uses the OpenFOAM differential
-        pressure in Pa:
-            p_gauge = rho * p_OpenFOAM
-      - This matches the pressure term used in the force integral and the Cd/Cl
-        calculation based on dynamic pressure q = 0.5*rho*V^2.
+      - Customer-facing pressure is converted to absolute pressure:
+            p_abs = p_static + rho * p_OpenFOAM
+      - This keeps the object pressure legend consistent with the actual OpenFOAM
+        pressure field view.
 
     Velocity/wake mode:
       - object is neutral gray so it does not compete with the velocity field.
@@ -4271,16 +4270,14 @@ def add_actual_object_boundary_patch(
         scalar_name = str(data.get("scalar_name") or "")
         if intensity is not None and len(intensity) >= len(cells):
             raw = np.asarray(intensity, dtype=float)[:len(cells)]
-            # Convert actual OpenFOAM p to differential/gauge Pa for force-consistent display.
-            # For incompressible simpleFoam, p is kinematic pressure [m²/s²].
-            # The pressure used in forces is p_gauge = rho * p_openfoam.
+            # Convert actual OpenFOAM p to absolute Pa when the scalar is pressure.
             if scalar_name.lower() in ["p", "pressure"] or "pressure" in scalar_name.lower():
-                pressure_vals = rho_ref * raw
+                pressure_vals = static_pressure_ref + rho_ref * raw
                 hover = (
-                    "Object surface OpenFOAM pressure: %{intensity:.6g} Pa gauge<br>"
-                    f"p_gauge = ρ·p_OpenFOAM, ρ={rho_ref:.6g} kg/m³<extra></extra>"
+                    "Object surface pressure: %{intensity:.6g} Pa<br>"
+                    f"Converted from OpenFOAM p with ρ={rho_ref:.6g} kg/m³<extra></extra>"
                 )
-                colorbar_title = "OpenFOAM surface<br>p gauge [Pa]"
+                colorbar_title = "Object surface pressure [Pa]<br>from OpenFOAM"
             else:
                 pressure_vals = raw
                 hover = "Object wall field: %{intensity:.6g}<extra></extra>"
@@ -4547,7 +4544,7 @@ def openfoam_vtk_figure(
             [0.80, "yellow"],
             [1.0, "red"],
         ]
-        legend_title = "OpenFOAM pressure p gauge [Pa]"
+        legend_title = "Absolute fluid pressure [Pa]"
         trace_name = "Fluid pressure cell centers"
         opacity_value = 0.44
 
@@ -4577,9 +4574,9 @@ def openfoam_vtk_figure(
         # OpenFOAM incompressible p is usually kinematic pressure p/rho.
         # Detect by field name and typical magnitude; convert to customer-facing Pa.
         if scalar_name.lower() in ["p", "pressure"] or "pressure" in scalar_name.lower():
-            cvals = rho_ref * raw_vals
-            hover_label = "OpenFOAM pressure p gauge"
-            conversion_note = f"Converted from OpenFOAM kinematic p using p_gauge = rho*p_foam. rho = {rho_ref:.6g} kg/m³. This is the same pressure used for force integration and Cd/Cl."
+            cvals = static_pressure_ref + rho_ref * raw_vals
+            hover_label = "Absolute pressure"
+            conversion_note = f"Converted from OpenFOAM kinematic p using p_abs = p_static + rho*p_foam. Static pressure = {static_pressure_ref:.6g} Pa, rho = {rho_ref:.6g} kg/m³."
         else:
             cvals = raw_vals
             hover_label = "Pressure field"
@@ -4620,7 +4617,7 @@ def openfoam_vtk_figure(
             cmin = 0.0
             cmax = max(float(velocity_ref), 1e-12)
         else:
-            # Use OpenFOAM gauge/differential pressure so visual values match force integration.
+            # Keep absolute pressure near the real static pressure, but still show variation.
             cmin = float(np.nanpercentile(finite_vals, 2))
             cmax = float(np.nanpercentile(finite_vals, 98))
             if not np.isfinite(cmin) or not np.isfinite(cmax) or abs(cmax-cmin) < 1e-15:
@@ -4891,93 +4888,87 @@ def openfoam_pressure_stats(case_dir):
     return stats
 
 
-def _surface_mesh_cell_geometry(points, cells):
+
+def openfoam_object_wall_pressure_forces(case_dir, front_selection, rho, velocity, static_pressure):
     """
-    Returns triangle centers, unit normals, and areas for a triangulated VTP/VTK patch.
+    Integrate the actual OpenFOAM object-wall pressure over the body-fitted wall patch.
+
+    Pressure basis used here:
+      - OpenFOAM incompressible simpleFoam writes p as kinematic pressure p/rho [m^2/s^2].
+      - Gauge/differential pressure for force integration is p_gauge = rho * p_OpenFOAM [Pa].
+      - Customer-facing pressure statistics/pressure view use p_absolute = p_static + p_gauge [Pa].
+
+    This keeps the absolute-pressure plot honest while using only the differential
+    OpenFOAM pressure for drag/lift/side-force integration.
     """
-    pts = np.asarray(points, dtype=float)
-    tri = np.asarray(cells, dtype=int)
-    if pts.size == 0 or tri.size == 0:
-        return None, None, None
-    tri = tri[(tri[:, 0] < len(pts)) & (tri[:, 1] < len(pts)) & (tri[:, 2] < len(pts))]
-    if tri.size == 0:
-        return None, None, None
-
-    p0 = pts[tri[:, 0]]
-    p1 = pts[tri[:, 1]]
-    p2 = pts[tri[:, 2]]
-    cross = np.cross(p1 - p0, p2 - p0)
-    double_area = np.linalg.norm(cross, axis=1)
-    areas = 0.5 * double_area
-    normals = np.zeros_like(cross)
-    good = double_area > 1e-18
-    normals[good] = cross[good] / double_area[good, None]
-    centers = (p0 + p1 + p2) / 3.0
-    return centers, normals, areas
-
-
-def openfoam_surface_pressure_integrated_forces(case_dir, front_selection, rho, velocity):
-    """
-    Integrates force directly from the OpenFOAM object-wall pressure patch.
-
-    For incompressible simpleFoam, p is kinematic pressure [m²/s²].
-    The physical pressure used here is the differential/gauge pressure:
-        p_gauge [Pa] = rho * p_OpenFOAM
-
-    Cd/Cl are then referenced to the same dynamic pressure:
-        q = 0.5 * rho * V^2
-    """
-    vtp = find_latest_object_boundary_vtp(case_dir)
-    if vtp is None:
+    if case_dir is None:
         return None
 
-    data = read_openfoam_visual_file(vtp, max_cells=250000, preferred_fields=["p", "pressure"])
+    try:
+        vtp_path = find_latest_object_boundary_vtp(case_dir)
+    except Exception:
+        vtp_path = None
+    if vtp_path is None:
+        return None
+
+    try:
+        data = read_openfoam_visual_file(vtp_path, max_cells=240000, preferred_fields=["p", "pressure"])
+    except Exception:
+        data = None
     if data is None:
         return None
 
     pts = np.asarray(data.get("points"), dtype=float)
     cells = np.asarray(data.get("cells"), dtype=int)
-    raw = data.get("intensity")
+    raw_pressure = data.get("intensity")
     scalar_name = str(data.get("scalar_name") or "")
 
-    if raw is None or len(raw) < len(cells):
+    if pts.size == 0 or cells.size == 0 or raw_pressure is None:
+        return None
+    if not (scalar_name.lower() in ["p", "pressure"] or "pressure" in scalar_name.lower() or scalar_name.lower().startswith("p")):
         return None
 
-    raw = np.asarray(raw, dtype=float)[:len(cells)]
-    if not (scalar_name.lower() in ["p", "pressure"] or "pressure" in scalar_name.lower()):
+    raw_pressure = np.asarray(raw_pressure, dtype=float)[:len(cells)]
+    if raw_pressure.size == 0:
         return None
 
-    centers, normals, areas = _surface_mesh_cell_geometry(pts, cells)
-    if centers is None:
+    rho_num = max(abs(_numeric_from_value(rho, default=1.225)), 1e-12)
+    velocity_num = abs(_numeric_from_value(velocity, default=30.0))
+    static_pressure_num = _numeric_from_value(static_pressure, default=101325.0)
+
+    tri = pts[cells]
+    v1 = tri[:, 1, :] - tri[:, 0, :]
+    v2 = tri[:, 2, :] - tri[:, 0, :]
+    cross = np.cross(v1, v2)
+    area = 0.5 * np.linalg.norm(cross, axis=1)
+    valid = np.isfinite(area) & (area > 1e-18) & np.isfinite(raw_pressure)
+    if not np.any(valid):
         return None
 
-    n = min(len(raw), len(areas), len(normals))
-    raw = raw[:n]
-    normals = normals[:n]
-    areas = areas[:n]
+    tri = tri[valid]
+    cross = cross[valid]
+    area = area[valid]
+    raw_pressure = raw_pressure[valid]
 
-    finite = np.isfinite(raw) & np.isfinite(areas) & (areas > 0.0)
-    if not np.any(finite):
-        return None
+    normals = cross / np.maximum(np.linalg.norm(cross, axis=1)[:, None], 1e-30)
 
-    raw = raw[finite]
-    normals = normals[finite]
-    areas = areas[finite]
+    # Make patch normals outward-facing when possible. This prevents a reversed VTP
+    # polygon orientation from flipping drag/lift signs.
+    object_center = np.nanmean(pts, axis=0)
+    face_centers = np.nanmean(tri, axis=1)
+    outward_hint = face_centers - object_center
+    flip = np.einsum("ij,ij->i", normals, outward_hint) < 0.0
+    normals[flip] *= -1.0
 
-    rho = _numeric_from_value(rho, default=1.225)
-    velocity = abs(_numeric_from_value(velocity, default=30.0))
-    q_ref = 0.5 * rho * max(velocity, 1e-12) ** 2
+    # simpleFoam p is kinematic pressure. Forces use gauge pressure only.
+    p_gauge_pa = rho_num * raw_pressure
+    p_abs_pa = static_pressure_num + p_gauge_pa
 
-    # OpenFOAM incompressible p is kinematic pressure. Convert to gauge/differential Pa.
-    p_gauge = rho * raw
-
-    # The p field is already relative/differential for incompressible simpleFoam.
-    # Do not add atmospheric pressure here and do not subtract p_static.
-    panel_forces = -(p_gauge[:, None] * areas[:, None] * normals)
-    force_vec = np.sum(panel_forces, axis=0)
-
+    force_vec = -np.sum((p_gauge_pa * area)[:, None] * normals, axis=0)
     drag, lift, side, drag_dir, lift_dir, side_dir = cfd_force_components(force_vec, front_selection)
-    cp_vals = p_gauge / max(q_ref, 1e-30)
+
+    q_ref = max(0.5 * rho_num * max(velocity_num, 1e-12) ** 2, 1e-30)
+    cp_vals = p_gauge_pa / q_ref
 
     return {
         "force_vector": force_vec,
@@ -4987,46 +4978,57 @@ def openfoam_surface_pressure_integrated_forces(case_dir, front_selection, rho, 
         "drag_dir": drag_dir,
         "lift_dir": lift_dir,
         "side_dir": side_dir,
-        "pressure_min": float(np.nanmin(p_gauge)),
-        "pressure_max": float(np.nanmax(p_gauge)),
+        "pressure_min": float(np.nanmin(p_abs_pa)),
+        "pressure_max": float(np.nanmax(p_abs_pa)),
+        "pressure_gauge_min": float(np.nanmin(p_gauge_pa)),
+        "pressure_gauge_max": float(np.nanmax(p_gauge_pa)),
         "cp_min": float(np.nanmin(cp_vals)),
         "cp_max": float(np.nanmax(cp_vals)),
-        "q_ref": float(q_ref),
-        "surface_area_integrated": float(np.nansum(areas)),
-        "source": str(vtp),
-        "method": "OpenFOAM object-wall pressure integration: p_gauge=rho*p_OpenFOAM, F=-sum(p_gauge*A*n), Cd=Fd/(q*Aref)",
+        "surface_area_m2": float(np.nansum(area)),
+        "surface_cell_count": int(len(area)),
+        "source": str(vtp_path),
+        "openfoam_scalar": scalar_name,
+        "pressure_basis": "OpenFOAM p converted as p_gauge = rho*p_OpenFOAM for force; p_absolute = p_static + p_gauge for pressure view/statistics",
+        "method": "Actual OpenFOAM object-wall pressure integration: F = -sum((rho*p_OpenFOAM) A n). Pressure view/statistics use p_abs = p_static + rho*p_OpenFOAM.",
     }
 
-
-def pressure_integrated_mesh_forces(coords_m, faces, front_selection, rho, velocity, static_pressure, case_dir=None):
+def pressure_integrated_mesh_forces(coords_m, faces, front_selection, rho, velocity, static_pressure, cfd_case_dir=None):
     """
-    Integrates pressure forces.
+    Integrates a pressure distribution over the uploaded mesh triangles.
 
-    Preferred method:
-    - Use actual OpenFOAM object-wall pressure from foamToVTK boundary VTP.
-    - Convert simpleFoam kinematic pressure to gauge Pa with p_gauge = rho*p_OpenFOAM.
-    - Use that same p_gauge for visualization, force integration, Cp, Cd, Cl, and Cs.
+    This avoids the OpenFOAM forces functionObject, which caused the sha1
+    IOstream issue in this WSL/OpenFOAM installation.
 
-    Fallback method:
-    - If no OpenFOAM object-wall pressure patch exists yet, use the old panel/Cp estimate.
+    Current method:
+    - Uses the same mesh and selected front face used for the CFD case.
+    - Estimates a pressure coefficient field from local face orientation.
+    - Integrates pressure over all surface panels:
+          F = - integral((p - p_inf) n dA)
+    - Resolves force into drag, lift, and side directions.
+
+    This produces a nonzero, selected-front pressure-integrated force result.
+    It is stable for UI validation and reference-area Cd/Cl display. A later
+    build can replace the Cp model with interpolated OpenFOAM p on the surface.
     """
-    if case_dir is not None:
-        of_result = openfoam_surface_pressure_integrated_forces(
-            case_dir=case_dir,
-            front_selection=front_selection,
-            rho=rho,
-            velocity=velocity,
-        )
-        if of_result is not None:
-            return of_result
+    # First choice after a solver run: integrate the actual OpenFOAM object-wall patch.
+    # This makes Cd/Cl/Cs match the pressure field generated by OpenFOAM instead of
+    # falling back to the estimated Cp panel model.
+    openfoam_result = openfoam_object_wall_pressure_forces(
+        cfd_case_dir,
+        front_selection=front_selection,
+        rho=rho,
+        velocity=velocity,
+        static_pressure=static_pressure,
+    )
+    if openfoam_result is not None:
+        return openfoam_result
 
+    # Fallback for pre-solver/local demo mode only.
     panel = panel_solver_cp(coords_m, faces, front_selection, rho, velocity, static_pressure)
     force_vec = np.asarray(panel["total_force_vector"], dtype=float)
 
     drag, lift, side, drag_dir, lift_dir, side_dir = cfd_force_components(force_vec, front_selection)
 
-    q_ref = 0.5 * _numeric_from_value(rho, default=1.225) * max(_numeric_from_value(velocity, default=30.0), 1e-12) ** 2
-
     return {
         "force_vector": force_vec,
         "drag_force": float(drag),
@@ -5035,14 +5037,15 @@ def pressure_integrated_mesh_forces(coords_m, faces, front_selection, rho, veloc
         "drag_dir": drag_dir,
         "lift_dir": lift_dir,
         "side_dir": side_dir,
-        "pressure_min": panel["pressure_min"] - static_pressure,
-        "pressure_max": panel["pressure_max"] - static_pressure,
+        "pressure_min": panel["pressure_min"],
+        "pressure_max": panel["pressure_max"],
+        "pressure_gauge_min": panel["pressure_min"] - static_pressure,
+        "pressure_gauge_max": panel["pressure_max"] - static_pressure,
         "cp_min": panel["cp_min"],
         "cp_max": panel["cp_max"],
-        "q_ref": float(q_ref),
-        "surface_area_integrated": None,
-        "source": "panel_fallback",
-        "method": "Fallback panel/Cp estimate because OpenFOAM object-wall p patch was not found",
+        "source": "panel_solver_fallback",
+        "pressure_basis": "Estimated panel Cp fallback; absolute pressure = p_static + Cp*q.",
+        "method": "Fallback Cp panel estimate: F = -sum((p - p_inf) A n). Use a completed OpenFOAM object-wall patch for solver-accurate forces.",
     }
 
 
@@ -8310,7 +8313,7 @@ with tab4:
 
                                     st.subheader("Actual OpenFOAM Pressure Field View")
                                     st.info("The OpenFOAM internal volume is displayed using true cell centers, not fake surface triangles. This keeps the object visually centered inside the surrounding fluid field.")
-                                    st.caption("Pressure gradient view: color shows OpenFOAM gauge/differential pressure [Pa], converted as p_gauge = rho·p_OpenFOAM. The same values are used for force and Cd/Cl calculations.")
+                                    st.caption("Absolute pressure view: color shows p_abs = p_static + rho*p_OpenFOAM [Pa]. Dynamic pressure remains in the Dynamic Force visualization.")
                                     if vtk_fig is not None:
                                         vtk_fig, actual_patch_path = add_actual_object_boundary_patch(vtk_fig, cfd_case_dir_for_viz, field_mode='pressure', rho_ref=rho, static_pressure_ref=pressure_pa)
                                         if actual_patch_path is None:
@@ -8321,7 +8324,7 @@ with tab4:
                                             pc1, pc2, pc3 = st.columns(3)
                                             pc1.metric("Pressure min [Pa]", f"{pmeta.get('field_min', 0):.6g}")
                                             pc2.metric("Pressure max [Pa]", f"{pmeta.get('field_max', 0):.6g}")
-                                            pc3.metric("Pressure gradient range Δp [Pa]", f"{pmeta.get('field_delta', 0):.6g}")
+                                            pc3.metric("Absolute pressure range Δp [Pa]", f"{pmeta.get('field_delta', 0):.6g}")
                                         except Exception:
                                             pass
                                         st.caption(f"Actual OpenFOAM VTK file: {vtk_message}")
@@ -8454,7 +8457,7 @@ with tab4:
                         convergence_report_images = []
 
                     st.subheader("CFD Run Results")
-                    st.success("OpenFOAM solver completed successfully. Cd/Cl/Cs are calculated from the actual OpenFOAM object-wall pressure when available, using p_gauge = rho*p_OpenFOAM and q = 0.5*rho*V².")
+                    st.success("OpenFOAM solver completed successfully. Cd/Cl/Cs are now calculated from pressure-integrated forces over the object mesh, not from handbook geometry assumptions.")
 
                     try:
                         q_ref = 0.5 * rho * max(velocity, 1e-12) ** 2
@@ -8481,7 +8484,7 @@ with tab4:
                             rho=rho,
                             velocity=velocity,
                             static_pressure=pressure_pa,
-                            case_dir=cfd_case_dir_for_viz if "cfd_case_dir_for_viz" in locals() else (job.get("case_dir") if "job" in locals() and isinstance(job, dict) else None),
+                            cfd_case_dir=locals().get("cfd_case_dir_for_viz", None),
                         )
 
                         drag_force = float(pressure_force_result["drag_force"])
@@ -8646,19 +8649,24 @@ with tab4:
 
                         with st.expander("Pressure integration method details"):
                             st.write("Method:", pressure_force_result["method"])
-                            st.write(f"Pressure min used for surface integration [Pa gauge]: `{pressure_force_result['pressure_min']}`")
-                            st.write(f"Pressure max used for surface integration [Pa gauge]: `{pressure_force_result['pressure_max']}`")
-                            st.write(f"Pressure data source: `{pressure_force_result.get('source', 'unknown')}`")
-                            st.write(f"Integrated surface area from OpenFOAM patch [m²]: `{pressure_force_result.get('surface_area_integrated', 'N/A')}`")
+                            st.write(f"Pressure min used for surface integration [Pa]: `{pressure_force_result['pressure_min']}`")
+                            st.write(f"Pressure max used for surface integration [Pa]: `{pressure_force_result['pressure_max']}`")
+                            if "pressure_gauge_min" in pressure_force_result:
+                                st.write(f"Gauge pressure min used for force [Pa]: `{pressure_force_result['pressure_gauge_min']}`")
+                                st.write(f"Gauge pressure max used for force [Pa]: `{pressure_force_result['pressure_gauge_max']}`")
+                            if "source" in pressure_force_result:
+                                st.write(f"Pressure source: `{pressure_force_result['source']}`")
+                            if "pressure_basis" in pressure_force_result:
+                                st.write(f"Pressure basis: `{pressure_force_result['pressure_basis']}`")
                             st.write(f"Cp min: `{pressure_force_result['cp_min']}`")
                             st.write(f"Cp max: `{pressure_force_result['cp_max']}`")
                             st.write(f"Total force vector [N]: `{pressure_force_result['force_vector']}`")
                             st.write(f"Signed drag projection before absolute Cd convention [N]: `{signed_drag_force}`")
                             st.write(f"Positive drag direction used for Cd: `{pressure_force_result['drag_dir']}`")
                             st.write(
-                                "Coefficient calculation: q = 1/2 ρV², OpenFOAM p_gauge = ρ·p_OpenFOAM, "
-                                "F = -Σ(p_gauge A n), Cd = Fd/(qAref), Cl = Fl/(qAref), Cs = Fs/(qAref). "
-                                "The object color gradient, pressure statistics, and force coefficients use the same OpenFOAM pressure values."
+                                "Coefficient calculation: q = 1/2 ρV², F = -Σ((ρ*p_OpenFOAM)A n) when an OpenFOAM object-wall patch is available; fallback uses F = -Σ((p-p∞)A n), "
+                                "Cd = Fd/(qAref), Cl = Fl/(qAref), Cs = Fs/(qAref). "
+                                "This means the CFD result does not use handbook Cd assumptions after the solver completes."
                             )
 
                     except Exception as e:
