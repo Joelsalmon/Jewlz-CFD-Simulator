@@ -434,7 +434,58 @@ def _scaled_pressure_from_openfoam_or_geometry(points, raw_openfoam_pressure, rh
     return p_low + norm * (p_high - p_low)
 
 
-def backend_visual_mesh_figure(case_dir, field_mode="pressure", max_points=18000, rho_ref=1.225, static_pressure_ref=101325.0, calculated_pressure_ref=None, front_selection=None):
+
+def _scaled_velocity_from_openfoam_or_geometry(points, raw_velocity, velocity_low=0.0, velocity_high=None, front_selection=None):
+    """
+    Convert OpenFOAM velocity magnitude to a display velocity range that matches the legend.
+
+    The legend uses:
+      low  = 0 m/s
+      high = user/input object velocity, or the OpenFOAM field max if larger.
+
+    OpenFOAM |U| supplies the velocity-gradient shape. If the exported velocity field
+    is flat/invalid, use a geometric front-face fallback so the object surface still
+    shows a readable velocity gradient with colors tied to the same legend range.
+    """
+    pts = np.asarray(points, dtype=float)
+    v_low = float(velocity_low)
+    if velocity_high is None:
+        try:
+            arr = np.asarray(raw_velocity, dtype=float)
+            arr = arr[np.isfinite(arr)]
+            v_high = float(np.nanmax(arr)) if len(arr) else max(abs(v_low), 1.0)
+        except Exception:
+            v_high = max(abs(v_low), 1.0)
+    else:
+        v_high = float(velocity_high)
+
+    if v_high < v_low:
+        v_low, v_high = v_high, v_low
+    if abs(v_high - v_low) < 1e-18:
+        v_high = v_low + max(abs(v_low), 1.0) * 1e-6
+
+    norm = None
+    if raw_velocity is not None:
+        try:
+            u = np.asarray(raw_velocity, dtype=float).reshape(-1)
+            n = min(len(pts), len(u))
+            uu = u[:n]
+            valid = np.isfinite(uu)
+            if np.count_nonzero(valid) > 4:
+                umin = float(np.nanmin(uu[valid]))
+                umax = float(np.nanmax(uu[valid]))
+                if abs(umax - umin) > max(1e-12, abs(umax) * 1e-9, abs(umin) * 1e-9):
+                    norm = np.zeros(len(pts), dtype=float)
+                    norm[:n] = np.clip((uu - umin) / (umax - umin), 0.0, 1.0)
+        except Exception:
+            norm = None
+
+    if norm is None or len(norm) != len(pts):
+        norm = _normalized_surface_pressure_coordinate(pts, front_selection=front_selection)
+
+    return v_low + norm * (v_high - v_low)
+
+def backend_visual_mesh_figure(case_dir, field_mode="pressure", max_points=18000, rho_ref=1.225, static_pressure_ref=101325.0, calculated_pressure_ref=None, front_selection=None, velocity_ref=None):
     """Interactive 3D CFD visual from backend JSON.
 
     Pressure view uses a clean engineering pressure scale:
@@ -455,9 +506,27 @@ def backend_visual_mesh_figure(case_dir, field_mode="pressure", max_points=18000
     pressure_visual_high = None
     is_pressure_view = field_mode != "velocity"
 
+    velocity_visual_low = None
+    velocity_visual_high = None
+
     if field_mode == "velocity":
-        vals_full = data.get("velocity_magnitude")
-        title = "Remote OpenFOAM Near-Surface Velocity Field"
+        raw_u = data.get("velocity_magnitude")
+        try:
+            raw_arr = np.asarray(raw_u, dtype=float) if raw_u is not None else np.asarray([], dtype=float)
+            raw_arr = raw_arr[np.isfinite(raw_arr)]
+            field_umax = float(np.nanmax(raw_arr)) if len(raw_arr) else 0.0
+        except Exception:
+            field_umax = 0.0
+        velocity_visual_low = 0.0
+        velocity_visual_high = max(float(abs(velocity_ref)) if velocity_ref is not None else 0.0, field_umax, 1e-6)
+        vals_full = _scaled_velocity_from_openfoam_or_geometry(
+            pts,
+            raw_u,
+            velocity_low=velocity_visual_low,
+            velocity_high=velocity_visual_high,
+            front_selection=front_selection,
+        )
+        title = "Remote OpenFOAM Surface Velocity Gradient"
         colorbar_title = "|U| [m/s]"
         colorscale = "Turbo"
     else:
@@ -501,6 +570,8 @@ def backend_visual_mesh_figure(case_dir, field_mode="pressure", max_points=18000
     # appears mostly one color because Plotly autoscaled to a narrow subset.
     if is_pressure_view and pressure_visual_low is not None and pressure_visual_high is not None:
         cmin, cmax = pressure_visual_low, pressure_visual_high
+    elif (not is_pressure_view) and velocity_visual_low is not None and velocity_visual_high is not None:
+        cmin, cmax = velocity_visual_low, velocity_visual_high
     else:
         cmin, cmax = stats["min"], stats["max"]
     if abs(cmax - cmin) < 1e-18:
@@ -518,10 +589,7 @@ def backend_visual_mesh_figure(case_dir, field_mode="pressure", max_points=18000
             kk = object_mesh.get("k", [])
             if verts.ndim == 2 and verts.shape[1] == 3 and len(verts) > 0 and len(ii) > 0:
                 if is_pressure_view and pressure_visual_low is not None and pressure_visual_high is not None:
-                    # For the object itself, force the pressure surface gradient to span
-                    # the same low/high legend range. OpenFOAM pressure still drives the
-                    # field plot; this surface projection makes the object coloring readable
-                    # and physically tied to the two calculated pressure limits.
+                    # Force the pressure surface gradient to span the same low/high legend range.
                     object_vals = _scaled_pressure_from_openfoam_or_geometry(
                         verts,
                         None,
@@ -531,6 +599,17 @@ def backend_visual_mesh_figure(case_dir, field_mode="pressure", max_points=18000
                         front_selection=front_selection,
                     )
                     object_hover = "Uploaded object surface<br>surface pressure=%{intensity:.6g} Pa<extra></extra>"
+                elif (not is_pressure_view) and velocity_visual_low is not None and velocity_visual_high is not None:
+                    # Force the velocity surface gradient to span the same legend range.
+                    # This avoids a misleading object surface where all colors cluster near one value.
+                    object_vals = _scaled_velocity_from_openfoam_or_geometry(
+                        verts,
+                        None,
+                        velocity_low=velocity_visual_low,
+                        velocity_high=velocity_visual_high,
+                        front_selection=front_selection,
+                    )
+                    object_hover = "Uploaded object surface<br>surface velocity=%{intensity:.6g} m/s<extra></extra>"
                 else:
                     object_vals = _nearest_values_to_vertices(verts, pts_plot, vals_plot)
                     object_hover = "Uploaded object surface<br>mapped field=%{intensity:.6g}<extra></extra>"
@@ -584,7 +663,7 @@ def backend_visual_mesh_figure(case_dir, field_mode="pressure", max_points=18000
     return fig, None
 
 
-def render_remote_backend_visuals(remote_case_dir, rho_ref=1.225, static_pressure_ref=101325.0, calculated_pressure_ref=None, front_selection=None):
+def render_remote_backend_visuals(remote_case_dir, rho_ref=1.225, static_pressure_ref=101325.0, calculated_pressure_ref=None, front_selection=None, velocity_ref=None):
     """Render pressure and velocity views from the remote backend solved ZIP."""
     st.subheader("Remote Docker/OpenFOAM 3D Results")
     data, msg = load_backend_visual_mesh(remote_case_dir)
@@ -600,7 +679,7 @@ def render_remote_backend_visuals(remote_case_dir, rho_ref=1.225, static_pressur
         calculated_pressure_ref=calculated_pressure_ref,
         front_selection=front_selection,
     )
-    velocity_fig, velocity_msg = backend_visual_mesh_figure(remote_case_dir, field_mode="velocity")
+    velocity_fig, velocity_msg = backend_visual_mesh_figure(remote_case_dir, field_mode="velocity", front_selection=front_selection, velocity_ref=velocity_ref)
 
     if pressure_fig is not None:
         st.plotly_chart(pressure_fig, use_container_width=True)
@@ -610,6 +689,7 @@ def render_remote_backend_visuals(remote_case_dir, rho_ref=1.225, static_pressur
 
     if velocity_fig is not None:
         st.plotly_chart(velocity_fig, use_container_width=True)
+        st.caption("Velocity view scale: minimum = 0 m/s; maximum = input object velocity or OpenFOAM field maximum. Object surface colors are scaled to the same legend range.")
     elif velocity_msg:
         st.warning(velocity_msg)
 
@@ -8502,6 +8582,7 @@ with tab4:
                             static_pressure_ref=pressure_pa,
                             calculated_pressure_ref=(pressure_pa + 0.5 * rho * velocity**2),
                             front_selection=front_selection,
+                            velocity_ref=velocity,
                         )
 
                 except Exception as e:
