@@ -492,8 +492,15 @@ def generate_cfd_visual_assets(results_dir: Path, logs: dict, max_points: int = 
         return assets
 
 @app.get("/health")
-def health(x_api_key: Optional[str] = Header(default=None)):
-    require_api_key(x_api_key)
+def health():
+    """
+    Public health endpoint for Streamlit/Cloudflare checks.
+
+    This endpoint must NOT require the X-API-Key header. If /health is
+    protected, Streamlit sees HTTP 401, assumes the backend is down, and
+    may hide the remote-backend controls. Job submission/download endpoints
+    remain protected by require_api_key().
+    """
 
     docker_ok = run_cmd(["docker", "ps"], timeout=15)
 
@@ -527,6 +534,7 @@ def health(x_api_key: Optional[str] = Header(default=None)):
         vtk_ok = str(e)
 
     return {
+        "status": "ok",
         "backend": "ready",
         "docker": docker_ok["returncode"] == 0,
         "openfoam_container": OPENFOAM_CONTAINER,
