@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import subprocess
+import requests
 import zipfile
 import sqlite3
 import json
@@ -55,6 +56,353 @@ AUTO_INSTALL_PDF_EXPORTER = True
 DOCKER_OPENFOAM_CONTAINER = "jewlz-openfoam"
 DOCKER_OPENFOAM_IMAGE = "opencfd/openfoam-default:latest"
 DOCKER_OPENFOAM_RUN_ROOT = "/tmp/jewlz_fluidforce_openfoam"
+
+
+
+
+# -----------------------------
+# Remote Jewlz CFD backend helpers
+# -----------------------------
+# These controls are intentionally independent from local Docker/OpenFOAM status.
+# The remote backend checkbox must never disappear because local OpenFOAM is missing.
+CFD_BACKEND_URL = ""
+CFD_BACKEND_API_KEY = ""
+try:
+    CFD_BACKEND_URL = st.secrets.get("CFD_BACKEND_URL", os.environ.get("CFD_BACKEND_URL", "")).rstrip("/")
+    CFD_BACKEND_API_KEY = st.secrets.get("CFD_BACKEND_API_KEY", os.environ.get("CFD_BACKEND_API_KEY", ""))
+except Exception:
+    CFD_BACKEND_URL = os.environ.get("CFD_BACKEND_URL", "").rstrip("/")
+    CFD_BACKEND_API_KEY = os.environ.get("CFD_BACKEND_API_KEY", "")
+
+
+def remote_backend_configured():
+    """True when Streamlit has a backend URL and API key configured."""
+    return bool(CFD_BACKEND_URL and CFD_BACKEND_API_KEY)
+
+
+def remote_cfd_backend_health(timeout=8):
+    """Check the remote Jewlz FastAPI/OpenFOAM backend. Never crashes the UI."""
+    if not remote_backend_configured():
+        return False, {"message": "CFD_BACKEND_URL or CFD_BACKEND_API_KEY is missing."}
+    try:
+        r = requests.get(
+            f"{CFD_BACKEND_URL}/health",
+            headers={"x-api-key": CFD_BACKEND_API_KEY},
+            timeout=timeout,
+        )
+        if r.ok:
+            try:
+                return True, r.json()
+            except Exception:
+                return True, {"message": r.text}
+        return False, {"message": r.text, "status_code": r.status_code}
+    except Exception as e:
+        return False, {"message": str(e)}
+
+
+def submit_case_zip_to_remote_backend(case_zip_path, run_solver=True, notes="", timeout=2400):
+    """Send generated OpenFOAM case ZIP to the private Jewlz CFD backend."""
+    if not remote_backend_configured():
+        raise RuntimeError("Remote backend is missing CFD_BACKEND_URL or CFD_BACKEND_API_KEY in Streamlit secrets.")
+
+    case_zip_path = Path(case_zip_path)
+    if not case_zip_path.exists():
+        raise RuntimeError(f"Case ZIP was not found: {case_zip_path}")
+
+    with case_zip_path.open("rb") as f:
+        files = {"case_zip": (case_zip_path.name, f, "application/zip")}
+        data = {
+            "run_solver": str(bool(run_solver)).lower(),
+            "run_snappy": "true",
+            "notes": notes or "",
+        }
+        r = requests.post(
+            f"{CFD_BACKEND_URL}/run_case_zip",
+            headers={"x-api-key": CFD_BACKEND_API_KEY},
+            files=files,
+            data=data,
+            timeout=timeout,
+        )
+
+    if not r.ok:
+        raise RuntimeError(f"Remote CFD backend failed: {r.text}")
+
+    content_type = (r.headers.get("content-type") or "").lower()
+    if "application/json" in content_type:
+        payload = r.json()
+        zip_b64 = payload.get("result_zip_base64") or payload.get("zip_base64")
+        if zip_b64:
+            return payload, base64.b64decode(zip_b64)
+        raise RuntimeError(f"Remote backend returned JSON but no ZIP payload: {payload}")
+
+    return {"status": "completed", "message": "Remote backend returned ZIP file directly."}, r.content
+
+
+def extract_remote_solved_case_zip(solved_zip_path, job_id):
+    """Extract solved backend ZIP into app data so the 3D visualizer can load backend JSON."""
+    solved_zip_path = Path(solved_zip_path)
+    remote_case_dir = app_data_dir() / "cases" / f"{job_id}_remote_solved"
+
+    if remote_case_dir.exists():
+        shutil.rmtree(remote_case_dir, ignore_errors=True)
+    remote_case_dir.mkdir(parents=True, exist_ok=True)
+
+    with zipfile.ZipFile(solved_zip_path, "r") as z:
+        for m in z.infolist():
+            name = m.filename.replace("\\", "/")
+            if name.startswith("/") or ".." in Path(name).parts:
+                raise RuntimeError(f"Unsafe ZIP member path from backend: {m.filename}")
+            z.extract(m, remote_case_dir)
+
+    return remote_case_dir
+
+
+def find_backend_visual_mesh_json(case_dir):
+    """Find backend-generated lightweight CFD visualization JSON."""
+    try:
+        candidates = list(Path(case_dir).rglob("cfd_visual_mesh.json"))
+        if not candidates:
+            return None
+        return sorted(candidates, key=lambda q: (-q.stat().st_mtime, str(q)))[0]
+    except Exception:
+        return None
+
+
+def load_backend_visual_mesh(case_dir):
+    """Load backend-generated CFD point cloud and object mesh."""
+    json_path = find_backend_visual_mesh_json(case_dir)
+    if json_path is None:
+        return None, "Backend cfd_visual_mesh.json was not found in solved ZIP."
+    try:
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+        pts = np.asarray(payload.get("points", []), dtype=float)
+        p = np.asarray(payload.get("pressure", []), dtype=float)
+        u = np.asarray(payload.get("velocity_magnitude", []), dtype=float)
+        if pts.ndim != 2 or pts.shape[1] != 3 or len(pts) == 0:
+            return None, f"Backend visual JSON has invalid point data: {json_path}"
+        return {
+            "path": str(json_path),
+            "points": pts,
+            "pressure": p if len(p) == len(pts) else None,
+            "velocity_magnitude": u if len(u) == len(pts) else None,
+            "object_mesh": payload.get("object_mesh"),
+            "metadata": payload.get("metadata", {}),
+        }, None
+    except Exception as e:
+        return None, f"Could not load backend visual JSON: {e}"
+
+
+def _field_stats(vals):
+    arr = np.asarray(vals, dtype=float) if vals is not None else np.asarray([], dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if len(arr) == 0:
+        return {"min": 0.0, "mean": 0.0, "max": 0.0, "range": 0.0}
+    return {
+        "min": float(np.nanmin(arr)),
+        "mean": float(np.nanmean(arr)),
+        "max": float(np.nanmax(arr)),
+        "range": float(np.nanmax(arr) - np.nanmin(arr)),
+    }
+
+
+def _openfoam_pressure_to_absolute_pa(raw_pressure, rho_ref=1.225, static_pressure_ref=101325.0):
+    """
+    Convert OpenFOAM incompressible pressure to customer-facing absolute pressure.
+    simpleFoam stores p as kinematic pressure [m²/s²], so p_gauge[Pa] = rho * p_OpenFOAM.
+    The pressure view uses p_absolute = p_static + p_gauge.
+    """
+    raw = np.asarray(raw_pressure, dtype=float)
+    rho_num = float(rho_ref) if rho_ref is not None else 1.225
+    p_static = float(static_pressure_ref) if static_pressure_ref is not None else 101325.0
+    return p_static + rho_num * raw
+
+
+def _filter_near_object_points(points, object_mesh, values, max_points=18000, distance_fraction=0.18):
+    """Keep only CFD points close to the uploaded object surface to reduce Plotly timeout risk."""
+    pts = np.asarray(points, dtype=float)
+    vals = np.asarray(values, dtype=float) if values is not None else np.zeros(len(pts))
+    try:
+        verts = np.asarray((object_mesh or {}).get("vertices", []), dtype=float)
+        if verts.ndim == 2 and verts.shape[1] == 3 and len(verts) > 0 and len(pts) > 0:
+            obj_min = np.nanmin(verts, axis=0)
+            obj_max = np.nanmax(verts, axis=0)
+            diag = float(np.linalg.norm(obj_max - obj_min))
+            tol = max(diag * float(distance_fraction), 1e-9)
+            lo = obj_min - tol
+            hi = obj_max + tol
+            mask = np.all((pts >= lo) & (pts <= hi), axis=1)
+            if np.count_nonzero(mask) >= 50:
+                pts = pts[mask]
+                vals = vals[mask]
+    except Exception:
+        pass
+
+    if len(pts) > max_points:
+        idx = np.linspace(0, len(pts) - 1, max_points).astype(int)
+        pts = pts[idx]
+        vals = vals[idx]
+    return pts, vals
+
+
+def _nearest_values_to_vertices(vertices, points, values, max_vertices=25000):
+    """Map CFD point values onto uploaded object surface for object-color gradients."""
+    try:
+        vertices = np.asarray(vertices, dtype=float)
+        points = np.asarray(points, dtype=float)
+        values = np.asarray(values, dtype=float).reshape(-1)
+        n = min(len(points), len(values))
+        points = points[:n]
+        values = values[:n]
+        good = np.isfinite(points).all(axis=1) & np.isfinite(values)
+        points = points[good]
+        values = values[good]
+        if vertices.ndim != 2 or vertices.shape[1] < 3 or len(vertices) == 0 or len(points) == 0:
+            return None
+        try:
+            from scipy.spatial import cKDTree
+            tree = cKDTree(points[:, :3])
+            _, nearest = tree.query(vertices[:, :3], k=1, workers=-1)
+            return values[np.asarray(nearest, dtype=int)]
+        except Exception:
+            if len(points) > 8000:
+                step = max(1, len(points) // 8000)
+                points = points[::step]
+                values = values[::step]
+            out = np.zeros(len(vertices), dtype=float)
+            chunk = 500
+            for start in range(0, len(vertices), chunk):
+                v = vertices[start:start + chunk, :3]
+                d2 = ((v[:, None, :] - points[None, :, :3]) ** 2).sum(axis=2)
+                out[start:start + chunk] = values[np.argmin(d2, axis=1)]
+            return out
+    except Exception:
+        return None
+
+
+def backend_visual_mesh_figure(case_dir, field_mode="pressure", max_points=18000, rho_ref=1.225, static_pressure_ref=101325.0):
+    """Interactive 3D CFD visual from backend JSON. Pressure view uses absolute pressure."""
+    data, msg = load_backend_visual_mesh(case_dir)
+    if data is None:
+        return None, msg
+
+    pts = data["points"]
+    object_mesh = data.get("object_mesh")
+
+    if field_mode == "velocity":
+        vals_full = data.get("velocity_magnitude")
+        title = "Remote OpenFOAM Near-Surface Velocity Field"
+        colorbar_title = "|U| [m/s]"
+        colorscale = "Turbo"
+    else:
+        raw_p = data.get("pressure")
+        vals_full = _openfoam_pressure_to_absolute_pa(raw_p, rho_ref=rho_ref, static_pressure_ref=static_pressure_ref) if raw_p is not None else None
+        title = "Remote OpenFOAM Near-Surface Absolute Pressure Field"
+        colorbar_title = "Absolute Pressure [Pa]"
+        colorscale = "Jet"
+
+    if vals_full is None or len(vals_full) != len(pts):
+        vals_full = np.zeros(len(pts))
+
+    pts_plot, vals_plot = _filter_near_object_points(
+        pts,
+        object_mesh,
+        vals_full,
+        max_points=max_points,
+        distance_fraction=0.22,
+    )
+
+    stats = _field_stats(vals_full)
+    cmin, cmax = stats["min"], stats["max"]
+    if abs(cmax - cmin) < 1e-18:
+        pad = max(abs(cmax), 1.0) * 1e-6
+        cmin -= pad
+        cmax += pad
+
+    fig = go.Figure()
+
+    if isinstance(object_mesh, dict) and not object_mesh.get("error"):
+        try:
+            verts = np.asarray(object_mesh.get("vertices", []), dtype=float)
+            ii = object_mesh.get("i", [])
+            jj = object_mesh.get("j", [])
+            kk = object_mesh.get("k", [])
+            if verts.ndim == 2 and verts.shape[1] == 3 and len(verts) > 0 and len(ii) > 0:
+                object_vals = _nearest_values_to_vertices(verts, pts_plot, vals_plot)
+                mesh_kwargs = dict(
+                    x=verts[:, 0], y=verts[:, 1], z=verts[:, 2],
+                    i=ii, j=jj, k=kk,
+                    name="Uploaded Object Surface — CFD Field Gradient",
+                    opacity=0.96,
+                    flatshading=True,
+                    hovertemplate="Uploaded object surface<br>mapped field=%{intensity:.6g}<extra></extra>",
+                    showscale=False,
+                )
+                if object_vals is not None and len(object_vals) == len(verts):
+                    mesh_kwargs.update(intensity=object_vals, colorscale=colorscale, cmin=cmin, cmax=cmax)
+                else:
+                    mesh_kwargs.update(color="lightgray")
+                fig.add_trace(go.Mesh3d(**mesh_kwargs))
+        except Exception:
+            pass
+
+    fig.add_trace(go.Scatter3d(
+        x=pts_plot[:, 0], y=pts_plot[:, 1], z=pts_plot[:, 2],
+        mode="markers",
+        marker=dict(
+            size=1.5,
+            color=vals_plot,
+            colorscale=colorscale,
+            opacity=0.34,
+            cmin=cmin,
+            cmax=cmax,
+            colorbar=dict(title=colorbar_title, tickformat=".3g", len=0.82),
+        ),
+        name=title,
+        text=[f"{colorbar_title}: {v:.6g}" for v in vals_plot],
+        hovertemplate="x=%{x:.5g}<br>y=%{y:.5g}<br>z=%{z:.5g}<br>%{text}<extra></extra>",
+    ))
+
+    fig.update_layout(
+        title=f"{title}<br><sup>{colorbar_title}: min={stats['min']:.6g}, mean={stats['mean']:.6g}, max={stats['max']:.6g}, range={stats['range']:.6g}</sup>",
+        scene=dict(
+            xaxis_title="X [m]",
+            yaxis_title="Y [m]",
+            zaxis_title="Z [m]",
+            aspectmode="data",
+            camera=dict(eye=dict(x=1.45, y=1.35, z=0.85)),
+        ),
+        margin=dict(l=0, r=0, t=72, b=0),
+        height=720,
+    )
+    return fig, None
+
+
+def render_remote_backend_visuals(remote_case_dir, rho_ref=1.225, static_pressure_ref=101325.0):
+    """Render pressure and velocity views from the remote backend solved ZIP."""
+    st.subheader("Remote Docker/OpenFOAM 3D Results")
+    data, msg = load_backend_visual_mesh(remote_case_dir)
+    if data is None:
+        st.warning(msg)
+        return
+
+    pressure_fig, pressure_msg = backend_visual_mesh_figure(
+        remote_case_dir,
+        field_mode="pressure",
+        rho_ref=rho_ref,
+        static_pressure_ref=static_pressure_ref,
+    )
+    velocity_fig, velocity_msg = backend_visual_mesh_figure(remote_case_dir, field_mode="velocity")
+
+    if pressure_fig is not None:
+        st.plotly_chart(pressure_fig, use_container_width=True)
+        st.caption("Pressure view uses absolute pressure: p_absolute = p_static + rho*p_OpenFOAM. Dynamic pressure remains in the dynamic force visualization.")
+    elif pressure_msg:
+        st.warning(pressure_msg)
+
+    if velocity_fig is not None:
+        st.plotly_chart(velocity_fig, use_container_width=True)
+    elif velocity_msg:
+        st.warning(velocity_msg)
 
 
 # Embedded Jewlz Technologies logo for PDF reports.
@@ -8079,7 +8427,7 @@ def render_openfoam_system_health(availability):
 
     if not all_ready:
         missing = ", ".join(label for label, ok in checks if not ok)
-        st.error(f"OpenFOAM system check failed: {missing}. Start Docker container {DOCKER_OPENFOAM_CONTAINER} or reconnect OpenFOAM/WSL before running CFD.")
+        st.error(f"OpenFOAM system check failed locally: {missing}. Local Docker/OpenFOAM is unavailable, but the remote Jewlz CFD backend option remains available below.")
 
 
 
@@ -8135,6 +8483,31 @@ with tab4:
             help="This can take a long time. Leave off for quick case generation."
         )
 
+        # Permanent remote backend UI. This checkbox is intentionally independent from local Docker/OpenFOAM health.
+        if "use_remote_backend" not in st.session_state:
+            st.session_state["use_remote_backend"] = True
+
+        use_remote_backend = st.checkbox(
+            "Run CFD through remote Jewlz backend",
+            value=st.session_state.get("use_remote_backend", True),
+            key="use_remote_backend_checkbox",
+            help="Send the generated OpenFOAM case ZIP to the Jewlz FastAPI backend through the secure Cloudflare tunnel. This option remains visible even if local Docker/OpenFOAM is unavailable."
+        )
+        st.session_state["use_remote_backend"] = bool(use_remote_backend)
+
+        if use_remote_backend:
+            if remote_backend_configured():
+                st.success("Remote Jewlz CFD backend selected.")
+                with st.expander("Remote backend configuration", expanded=False):
+                    st.write(f"Backend URL: {CFD_BACKEND_URL}")
+                    health_ok, health_info = remote_cfd_backend_health(timeout=8)
+                    if health_ok:
+                        st.success("Remote Jewlz CFD backend connected through secure API tunnel.")
+                    else:
+                        st.warning(f"Remote backend health check did not pass yet: {health_info}")
+            else:
+                st.error("Remote backend selected, but CFD_BACKEND_URL or CFD_BACKEND_API_KEY is missing in Streamlit secrets/environment variables.")
+
         if st.button("Submit CFD Job"):
             input_data = {
                 "notes": job_notes,
@@ -8186,6 +8559,65 @@ with tab4:
                 st.success(f"CFD job submitted and case generated: {job_id}")
             else:
                 st.error(f"CFD job failed: {msg}")
+
+            if ok and use_remote_backend:
+                remote_progress = st.progress(0.0)
+                remote_status = st.empty()
+                try:
+                    if not remote_backend_configured():
+                        raise RuntimeError("CFD_BACKEND_URL or CFD_BACKEND_API_KEY is missing in Streamlit secrets/environment variables.")
+
+                    job_record = get_cfd_job(job_id)
+                    case_zip_path = None
+                    if job_record:
+                        case_zip_path = job_record.get("zip_path")
+                    if not case_zip_path:
+                        case_zip_path = str(app_data_dir() / "jobs" / f"{job_id}.zip")
+
+                    remote_status.info("25% — Case ZIP generated. Uploading to remote Docker/OpenFOAM backend.")
+                    remote_progress.progress(0.25)
+
+                    backend_status, solved_zip_bytes = submit_case_zip_to_remote_backend(
+                        case_zip_path,
+                        run_solver=run_solver_after_meshing,
+                        notes=job_notes,
+                        timeout=2400,
+                    )
+
+                    remote_status.info("80% — Remote OpenFOAM completed. Extracting solved results and visualization data.")
+                    remote_progress.progress(0.80)
+
+                    solved_zip_path = app_data_dir() / "jobs" / f"{job_id}_remote_solved.zip"
+                    solved_zip_path.write_bytes(solved_zip_bytes)
+                    remote_case_dir = extract_remote_solved_case_zip(solved_zip_path, job_id)
+
+                    remote_status.success("100% — Remote Docker/OpenFOAM results received.")
+                    remote_progress.progress(1.0)
+
+                    st.download_button(
+                        "Download Remote Solved CFD Case ZIP",
+                        data=solved_zip_bytes,
+                        file_name=f"{job_id}_remote_solved.zip",
+                        mime="application/zip",
+                    )
+
+                    st.session_state["latest_remote_cfd_case_dir"] = str(remote_case_dir)
+                    st.session_state["latest_remote_cfd_job_id"] = job_id
+                    st.session_state["latest_remote_cfd_zip"] = str(solved_zip_path)
+                    try:
+                        _remote_data, _remote_msg = load_backend_visual_mesh(remote_case_dir)
+                        if _remote_data is not None:
+                            st.session_state["latest_remote_cfd_visual_data"] = _remote_data
+                    except Exception:
+                        pass
+
+                    render_remote_backend_visuals(remote_case_dir, rho_ref=rho, static_pressure_ref=pressure_pa)
+
+                except Exception as e:
+                    remote_status.error(f"Remote CFD backend failed: {e}")
+                    remote_progress.progress(1.0)
+
+                # Keep rendering the rest of the app/tabs after remote CFD completion.
 
             if ok and run_case_after_generation:
                 progress_box = st.container()
