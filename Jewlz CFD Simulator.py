@@ -7480,6 +7480,10 @@ def append_session_cached_cfd_visuals(report_images):
         "cached_cfd_pressure_visual",
         "cached_cfd_velocity_visual",
         "cached_cfd_interference_visual",
+        "cached_cfd_force_visual",
+        "cached_cfd_optimization_chart",
+        "cached_cfd_optimized_geometry",
+        "cached_cfd_convergence_visual",
         "cached_cfd_error_visual",
     ]
     added = 0
@@ -7757,6 +7761,27 @@ def make_fluidforce_pdf_report(
         ]
         story.append(table_from_rows(cfd_rows))
 
+    story.append(Paragraph("Solver Diagnostics and Export Metadata", section_style))
+    solver_rows = [
+        ["Quantity", "Value"],
+        ["JET FluidForce Version", "V3.85 / PDF visual export enabled"],
+        ["OpenFOAM Solver", "simpleFoam when remote/local solver is executed"],
+        ["Turbulence Model", turbulence_model],
+        ["Pressure Field Basis", "OpenFOAM field mapped to uploaded-object surface when available"],
+        ["Velocity Field Basis", "OpenFOAM |U| field mapped to uploaded-object surface when available"],
+        ["PDF Visual Export", "PNG snapshots generated from simulator Plotly/Matplotlib views"],
+    ]
+    if cfd_results is not None:
+        try:
+            solver_rows.extend([
+                ["Convergence Quality", str(cfd_results.get("convergence_quality", "N/A"))],
+                ["Worst Latest Final Residual", fmt(cfd_results.get("max_final_residual", "N/A"))],
+                ["All-Run Max Final Residual", fmt(cfd_results.get("all_run_max_final_residual", "N/A"))],
+            ])
+        except Exception:
+            pass
+    story.append(table_from_rows(solver_rows))
+
     if cfd_results is not None:
         story.append(Paragraph("CFD Pressure-Integrated Coefficients", section_style))
         cfd_result_rows = [
@@ -7780,8 +7805,8 @@ def make_fluidforce_pdf_report(
         story.append(PageBreak())
         story.append(Paragraph("CFD and Engineering Visualizations", section_style))
         story.append(Paragraph(
-            "The following figures are captured directly from the simulator views. "
-            "They document the geometry, OpenFOAM pressure field, OpenFOAM velocity field, realistic flow interference, force vectors, and error/convergence status when available.",
+            "The following figures are exported as PNG images from the exact simulator 3D views and embedded into this PDF. "
+            "They document the uploaded geometry, OpenFOAM pressure distribution, OpenFOAM velocity/wake distribution, realistic flow interference, force vectors, optimization results, and solver diagnostics when available.",
             body_style
         ))
         for idx_img, img in enumerate(report_images, start=1):
@@ -8823,6 +8848,28 @@ with tab4:
                         convergence_records, convergence_summary, convergence_fig = [], None, None
                         convergence_report_images = []
 
+                    try:
+                        if convergence_report_images:
+                            for _conv_img in convergence_report_images:
+                                if isinstance(_conv_img, dict) and _conv_img.get("data"):
+                                    cache_cfd_report_visual(
+                                        "cached_cfd_convergence_visual",
+                                        _conv_img.get("title", "OpenFOAM Solver Convergence / Residual View"),
+                                        _conv_img.get("data"),
+                                        _conv_img.get("caption", "OpenFOAM solver residuals, convergence quality, and run diagnostics."),
+                                    )
+                                    break
+                        elif convergence_fig is not None:
+                            conv_png_for_report = plotly_fig_to_png_bytes(convergence_fig, width=1500, height=900, scale=2.0)
+                            cache_cfd_report_visual(
+                                "cached_cfd_convergence_visual",
+                                "OpenFOAM Solver Convergence / Residual View",
+                                conv_png_for_report,
+                                "OpenFOAM solver residuals, convergence quality, and run diagnostics.",
+                            )
+                    except Exception:
+                        pass
+
                     st.subheader("CFD Run Results")
                     st.success("OpenFOAM solver completed successfully. Cd/Cl/Cs are now calculated from pressure-integrated forces over the object mesh, not from handbook geometry assumptions.")
 
@@ -8944,10 +8991,17 @@ with tab4:
                                             coords_m, faces, bounds_m, front_selection, drag_force, lift_force,
                                             rho=rho, velocity=velocity, static_pressure=pressure_pa, side_force=side_force
                                         )
+                                        force_vector_png_for_report = plotly_fig_to_png_bytes(force_vector_report_fig)
+                                        cache_cfd_report_visual(
+                                            "cached_cfd_force_visual",
+                                            "Force Vector and Surface Loading View",
+                                            force_vector_png_for_report,
+                                            "Resultant force vectors and all-face pressure-loading map for engineering interpretation.",
+                                        )
                                         add_report_image(
                                             cfd_report_images,
                                             "Force Vector and Surface Loading View",
-                                            fig=force_vector_report_fig,
+                                            data=force_vector_png_for_report,
                                             caption="Resultant force vectors and all-face pressure-loading map for engineering interpretation.",
                                         )
                                     except Exception:
@@ -9247,10 +9301,30 @@ with tab8:
 
             fig_opt = make_design_optimization_figure(opt_df, opt_objective)
             st.plotly_chart(fig_opt, use_container_width=True)
+            try:
+                opt_png_for_report = plotly_fig_to_png_bytes(fig_opt, width=1500, height=900, scale=2.0)
+                cache_cfd_report_visual(
+                    "cached_cfd_optimization_chart",
+                    "Design Optimization Ranking View",
+                    opt_png_for_report,
+                    f"Optimization ranking for objective: {opt_objective}. The figure compares candidate design changes using the current fluid state, reference area, velocity, and force equations.",
+                )
+            except Exception:
+                pass
 
             st.subheader("Optimized Geometry Preview")
             preview_fig = make_optimized_geometry_preview(coords_m, faces, bounds_m, front_selection, best)
             st.plotly_chart(preview_fig, use_container_width=True)
+            try:
+                preview_png_for_report = plotly_fig_to_png_bytes(preview_fig, width=1500, height=1000, scale=2.0)
+                cache_cfd_report_visual(
+                    "cached_cfd_optimized_geometry",
+                    "Optimized Geometry Preview",
+                    preview_png_for_report,
+                    f"Preview of the top-ranked geometry concept: {best['Design Change']}.",
+                )
+            except Exception:
+                pass
 
             with st.expander("Ranked optimization candidates", expanded=True):
                 display_cols = [
@@ -9454,7 +9528,7 @@ with tab5:
     )
 
     st.subheader("PDF Engineering Report")
-    st.caption("PDF reports include Jewlz Technologies branding. OpenFOAM pressure/velocity visuals are cached after display and inserted into the main PDF.")
+    st.caption("PDF reports include Jewlz Technologies branding. Geometry, OpenFOAM pressure, OpenFOAM velocity, flow interference, force vectors, optimization, and solver diagnostics are exported as PNG visuals and inserted into the PDF.")
     st.info("For accurate CFD visuals in the PDF, keep Auto-setup PDF visual exporter enabled or run: python -m pip install -U kaleido==0.2.1")
     cached_visual_count = sum(1 for k in ["cached_cfd_pressure_visual", "cached_cfd_velocity_visual", "cached_cfd_interference_visual"] if isinstance(st.session_state.get(k), dict) and st.session_state.get(k, {}).get("data"))
     if cached_visual_count:
@@ -9500,10 +9574,17 @@ with tab5:
                         coords_m, faces, bounds_m, front_selection, fd, fl,
                         rho=rho, velocity=velocity, static_pressure=pressure_pa, side_force=0.0
                     )
+                    force_png_for_report = plotly_fig_to_png_bytes(force_fig_for_report)
+                    cache_cfd_report_visual(
+                        "cached_cfd_force_visual",
+                        "Dynamic Force Vector and Pressure Loading View",
+                        force_png_for_report,
+                        "Object pressure-loading map scaled to the calculated drag, lift, and side-force values.",
+                    )
                     add_report_image(
                         report_images,
                         "Dynamic Force Vector and Pressure Loading View",
-                        fig=force_fig_for_report,
+                        data=force_png_for_report,
                         caption="Object pressure-loading map scaled to the calculated drag, lift, and side-force values.",
                     )
             except Exception as pdf_visual_error:
