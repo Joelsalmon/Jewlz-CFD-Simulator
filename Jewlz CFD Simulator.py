@@ -141,39 +141,85 @@ def pressure_from_altitude(altitude_m: float) -> float:
 # -----------------------------
 # These controls are intentionally independent from local Docker/OpenFOAM status.
 # The remote backend checkbox must never disappear because local OpenFOAM is missing.
+#
+# Current active Cloudflare tunnel verified by /health:
+#   https://sending-carol-canberra-add.trycloudflare.com
+#
+# For customer use, keep this URL in Streamlit Secrets as CFD_BACKEND_URL.
+# A future permanent domain such as https://cfd.jewlztech.com can replace it here
+# without changing the rest of the app.
+DEFAULT_CFD_BACKEND_URL = "https://sending-carol-canberra-add.trycloudflare.com"
+DEFAULT_CFD_BACKEND_API_KEY = "JewlzCFD2026SecureKey"
+
 CFD_BACKEND_URL = ""
 CFD_BACKEND_API_KEY = ""
+
 try:
-    CFD_BACKEND_URL = st.secrets.get("CFD_BACKEND_URL", os.environ.get("CFD_BACKEND_URL", "")).rstrip("/")
-    CFD_BACKEND_API_KEY = st.secrets.get("CFD_BACKEND_API_KEY", os.environ.get("CFD_BACKEND_API_KEY", ""))
+    CFD_BACKEND_URL = (
+        st.secrets.get(
+            "CFD_BACKEND_URL",
+            os.environ.get("CFD_BACKEND_URL", DEFAULT_CFD_BACKEND_URL),
+        )
+        or DEFAULT_CFD_BACKEND_URL
+    ).rstrip("/")
+
+    CFD_BACKEND_API_KEY = (
+        st.secrets.get(
+            "CFD_BACKEND_API_KEY",
+            os.environ.get(
+                "CFD_BACKEND_API_KEY",
+                os.environ.get("JEWLZ_CFD_API_KEY", DEFAULT_CFD_BACKEND_API_KEY),
+            ),
+        )
+        or DEFAULT_CFD_BACKEND_API_KEY
+    )
 except Exception:
-    CFD_BACKEND_URL = os.environ.get("CFD_BACKEND_URL", "").rstrip("/")
-    CFD_BACKEND_API_KEY = os.environ.get("CFD_BACKEND_API_KEY", "")
+    CFD_BACKEND_URL = (
+        os.environ.get("CFD_BACKEND_URL", DEFAULT_CFD_BACKEND_URL)
+        or DEFAULT_CFD_BACKEND_URL
+    ).rstrip("/")
+    CFD_BACKEND_API_KEY = (
+        os.environ.get(
+            "CFD_BACKEND_API_KEY",
+            os.environ.get("JEWLZ_CFD_API_KEY", DEFAULT_CFD_BACKEND_API_KEY),
+        )
+        or DEFAULT_CFD_BACKEND_API_KEY
+    )
 
 
 def remote_backend_configured():
-    """True when Streamlit has a backend URL and API key configured."""
+    """True when the app has a backend URL and API key for protected submit/download endpoints."""
     return bool(CFD_BACKEND_URL and CFD_BACKEND_API_KEY)
 
 
 def remote_cfd_backend_health(timeout=8):
-    """Check the remote Jewlz FastAPI/OpenFOAM backend. Never crashes the UI."""
-    if not remote_backend_configured():
-        return False, {"message": "CFD_BACKEND_URL or CFD_BACKEND_API_KEY is missing."}
+    """
+    Public backend health check.
+
+    /health is intentionally public on the backend now. Do not require the API
+    key for this check, otherwise a key mismatch can make the UI think the
+    backend disappeared even when Docker/OpenFOAM are actually ready.
+    """
+    if not CFD_BACKEND_URL:
+        return False, {"message": "CFD_BACKEND_URL is missing."}
+
     try:
-        r = requests.get(
-            f"{CFD_BACKEND_URL}/health",
-            headers={"x-api-key": CFD_BACKEND_API_KEY},
-            timeout=timeout,
-        )
+        r = requests.get(f"{CFD_BACKEND_URL}/health", timeout=timeout)
+
         if r.ok:
             try:
                 return True, r.json()
             except Exception:
                 return True, {"message": r.text}
-        return False, {"message": r.text, "status_code": r.status_code}
+
+        return False, {
+            "message": r.text,
+            "status_code": r.status_code,
+            "backend_url": CFD_BACKEND_URL,
+        }
+
     except Exception as e:
-        return False, {"message": str(e)}
+        return False, {"message": str(e), "backend_url": CFD_BACKEND_URL}
 
 
 def submit_case_zip_to_remote_backend(case_zip_path, run_solver=True, notes="", timeout=2400):
