@@ -7452,18 +7452,35 @@ def add_report_image(report_images, title, fig=None, data=None, caption=""):
 
 def cache_cfd_report_visual(key, title, data, caption=""):
     """
-    Saves CFD visual PNG bytes in Streamlit session state so the main customer
-    PDF can include them even after the app reruns.
+    Saves CFD visual PNG bytes in Streamlit session state AND to a small
+    file-backed cache. The file-backed cache is important because the main PDF
+    button can run after a Streamlit rerun where local Plotly figure variables
+    no longer exist.
     """
     try:
-        if data:
-            data = clean_pdf_visual_png_bytes(data)
-            st.session_state[key] = {
-                "title": title,
-                "caption": caption,
-                "data": data,
-                "timestamp": datetime.now().isoformat(),
-            }
+        if not data:
+            return
+        data = clean_pdf_visual_png_bytes(data)
+        item = {
+            "title": title,
+            "caption": caption,
+            "data": data,
+            "timestamp": datetime.now().isoformat(),
+        }
+        st.session_state[key] = item
+
+        # Persistent cache for the current app session/deployment. This avoids
+        # losing pressure/velocity PNGs before the user clicks the main PDF
+        # download button.
+        try:
+            visual_dir = Path(".jewlz_fluidforce") / "report_visuals"
+            visual_dir.mkdir(parents=True, exist_ok=True)
+            safe_key = "".join(ch if ch.isalnum() or ch in "_-" else "_" for ch in str(key))
+            (visual_dir / f"{safe_key}.png").write_bytes(data)
+            meta = {"title": title, "caption": caption, "timestamp": item["timestamp"]}
+            (visual_dir / f"{safe_key}.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -7491,6 +7508,27 @@ def append_session_cached_cfd_visuals(report_images):
 
     for key in keys:
         item = st.session_state.get(key)
+
+        # If Streamlit reran and session state does not contain bytes, fall back
+        # to the file-backed PNG cache written when the visual was displayed.
+        if not isinstance(item, dict) or not item.get("data"):
+            try:
+                visual_dir = Path(".jewlz_fluidforce") / "report_visuals"
+                safe_key = "".join(ch if ch.isalnum() or ch in "_-" else "_" for ch in str(key))
+                png_path = visual_dir / f"{safe_key}.png"
+                meta_path = visual_dir / f"{safe_key}.json"
+                if png_path.exists() and png_path.stat().st_size > 1000:
+                    meta = {}
+                    if meta_path.exists():
+                        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                    item = {
+                        "title": meta.get("title", key),
+                        "caption": meta.get("caption", ""),
+                        "data": png_path.read_bytes(),
+                    }
+            except Exception:
+                item = None
+
         if not isinstance(item, dict):
             continue
         data = item.get("data")
@@ -9567,14 +9605,6 @@ with tab5:
                         caption="Uploaded geometry, orientation, and selected incoming-flow reference face.",
                     )
 
-                    # Add the latest displayed OpenFOAM CFD pressure/velocity visuals
-                    # from session cache. This is the most reliable path because
-                    # Streamlit reruns clear local variables before PDF export.
-                    cached_count = append_session_cached_cfd_visuals(report_images)
-
-                    # Do not assume cached visuals are complete. The PDF must include
-                    # pressure and velocity PNGs, so rebuild them from the latest
-                    # completed OpenFOAM case whenever either one is missing.
                     def _pdf_has_title_contains(items, *needles):
                         try:
                             for _item in items or []:
@@ -9586,6 +9616,38 @@ with tab5:
                             pass
                         return False
 
+                    # First use any current in-memory OpenFOAM figures from this run.
+                    # This is the most accurate source because it is the same figure
+                    # object shown on screen.
+                    try:
+                        if locals().get("vtk_fig") is not None and not _pdf_has_title_contains(report_images, "pressure"):
+                            add_report_image(
+                                report_images,
+                                "Actual OpenFOAM Pressure Field View",
+                                fig=locals().get("vtk_fig"),
+                                caption="OpenFOAM pressure field from the same 3D view shown in the simulator.",
+                            )
+                    except Exception:
+                        pass
+                    try:
+                        if locals().get("wake_fig") is not None and not (_pdf_has_title_contains(report_images, "velocity") or _pdf_has_title_contains(report_images, "wake")):
+                            add_report_image(
+                                report_images,
+                                "Actual OpenFOAM Velocity / Wake Field View",
+                                fig=locals().get("wake_fig"),
+                                caption="OpenFOAM velocity/wake field from the same 3D view shown in the simulator.",
+                            )
+                    except Exception:
+                        pass
+
+                    # Add the latest displayed OpenFOAM CFD pressure/velocity visuals
+                    # from session/file cache. This is the most reliable path because
+                    # Streamlit reruns clear local variables before PDF export.
+                    cached_count = append_session_cached_cfd_visuals(report_images)
+
+                    # Do not assume cached visuals are complete. The PDF must include
+                    # pressure and velocity PNGs, so rebuild them from the latest
+                    # completed OpenFOAM case whenever either one is missing.
                     _has_pressure_png = _pdf_has_title_contains(report_images, "pressure")
                     _has_velocity_png = _pdf_has_title_contains(report_images, "velocity") or _pdf_has_title_contains(report_images, "wake")
                     if not (_has_pressure_png and _has_velocity_png):
@@ -9601,6 +9663,13 @@ with tab5:
                             streamline_pronounce=streamline_pronounce,
                             show_openfoam_fluid_field=show_openfoam_fluid_field,
                         )
+
+                    _has_pressure_png = _pdf_has_title_contains(report_images, "pressure")
+                    _has_velocity_png = _pdf_has_title_contains(report_images, "velocity") or _pdf_has_title_contains(report_images, "wake")
+                    if include_cfd_visuals_in_pdf and not _has_pressure_png:
+                        st.warning("PDF export did not find a pressure PNG. Display the OpenFOAM pressure view once, then download the report again.")
+                    if include_cfd_visuals_in_pdf and not _has_velocity_png:
+                        st.warning("PDF export did not find a velocity PNG. Display the OpenFOAM velocity/wake view once, then download the report again.")
 
                     # Add the force figure only once. It may already exist in the
                     # session cache from a previous rerun.
