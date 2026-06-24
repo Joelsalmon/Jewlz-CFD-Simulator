@@ -142,13 +142,13 @@ def pressure_from_altitude(altitude_m: float) -> float:
 # These controls are intentionally independent from local Docker/OpenFOAM status.
 # The remote backend checkbox must never disappear because local OpenFOAM is missing.
 #
-# Current active Cloudflare tunnel verified by /health:
+# DigitalOcean CFD backend verified by /health:
 #   https://sending-carol-canberra-add.trycloudflare.com
 #
 # For customer use, keep this URL in Streamlit Secrets as CFD_BACKEND_URL.
 # A future permanent domain such as https://cfd.jewlztech.com can replace it here
 # without changing the rest of the app.
-DEFAULT_CFD_BACKEND_URL = "https://sending-carol-canberra-add.trycloudflare.com"
+DEFAULT_CFD_BACKEND_URL = "http://64.227.6.243:8000"
 DEFAULT_CFD_BACKEND_API_KEY = "JewlzCFD2026SecureKey"
 
 CFD_BACKEND_URL = ""
