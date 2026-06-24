@@ -25,8 +25,21 @@ app.add_middleware(
 )
 
 def require_api_key(x_api_key: Optional[str]):
+    """
+    Require X-API-Key only when a real JEWLZ_CFD_API_KEY is configured.
+
+    Production:
+      Set JEWLZ_CFD_API_KEY on the server and Streamlit must send the same
+      key in the X-API-Key header.
+
+    Testing / temporary public backend:
+      If JEWLZ_CFD_API_KEY is missing or still set to CHANGE_ME_BEFORE_PUBLIC_USE,
+      allow the request instead of blocking CFD jobs. This keeps /run_case_zip
+      usable while the DigitalOcean backend is being tested.
+    """
     if not API_KEY or API_KEY == "CHANGE_ME_BEFORE_PUBLIC_USE":
-        raise HTTPException(status_code=500, detail="Set JEWLZ_CFD_API_KEY before exposing the tunnel.")
+        return
+
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized CFD backend request.")
 
